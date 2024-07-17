@@ -1,0 +1,2382 @@
+---
+title: ""
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    number_sections: true
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, echo=FALSE, message=FALSE, warning=FALSE}
+library(knitr)
+library(readxl)
+library(dplyr)
+library(stringr)
+library(oligo)
+#library(affy)
+library(affycoretools)
+library(limma)
+library(clariomdhumantranscriptcluster.db)
+library(pd.clariom.d.human)
+library(hgu133a2.db)
+library(pd.hg.u133.plus.2)
+library(ggplot2); theme_set(
+  theme_bw(20) +
+    theme(panel.grid.major = element_blank(),
+          panel.grid.minor = element_blank(),
+          panel.border = element_rect(colour="black", fill=NA, size=1),
+          axis.text=element_text(colour="black"),
+          axis.ticks=element_line(colour="black"),
+          legend.key = element_blank(),
+          text = element_text(size=20),
+          strip.text.x = element_text(size = 10,margin = margin( b = 2, t = 2) ),
+            strip.background = element_rect(fill="white", colour="black")))
+library(kableExtra)
+library(plotly)
+library(randomcoloR)
+library(ggrepel)
+library(ggbeeswarm)
+library(ComplexHeatmap)
+library(umap)
+library(GEOquery)
+library(forcats)
+library(tidyr)
+library(sva)
+library(ggvenn)
+library(eulerr)
+library(clusterProfiler)
+library(enrichplot)
+library(viridis)
+
+opts_chunk$set(fig.width=6, fig.height=4.0, cache = TRUE, echo=FALSE, warning=FALSE, message=FALSE, results='hide')
+opts_knit$set(root.dir = "/Users/hdeberg/Box/P253_PeterM_Campbell_Keratinocytes_Fibroblasts")
+
+options(stringsAsFactors = FALSE)
+```
+
+```{r set_up_directories}
+
+baseDir <- "/Users/hdeberg/Box/P253_PeterM_Campbell_Keratinocytes_Fibroblasts"
+dataDir <- file.path(baseDir, "data")
+geoDataDir <- file.path(baseDir, "data", "GEODatasets")
+plotsDir <- file.path(baseDir, "plots")
+tablesDir <- file.path(baseDir, "tables")
+
+```
+
+
+```{r get_metadata}
+
+gdsGSE31652 <- getGEO("GSE31652")
+GSE31652Anno <- gdsGSE31652$GSE31652_series_matrix.txt.gz@phenoData@data
+
+GSE31652Anno <- GSE31652Anno %>%
+  dplyr::mutate(donor = str_replace_all(`patient:ch1`, "Patient: ", "X"),  
+                visit = str_replace_all(`time:ch1`, "Time: ", ""),
+                dosage = str_replace_all(`dosage:ch1`, "Dosage: ", ""),
+                filename = paste0(geo_accession, ".CEL"),
+                gse = "GSE31652",
+                dosage = case_when(dosage == "Placebo" ~ "Placebo",
+                                   dosage == "150 mg" ~ "Ixekizumab"),
+                                   dosage = factor(dosage, levels = c("Placebo", "Ixekizumab")),
+                visit = str_replace_all(visit, " ", "_")) 
+
+gdsGSE166388 <- getGEO("GSE166388")
+GSE166388Anno <- gdsGSE166388$GSE166388_series_matrix.txt.gz@phenoData@data
+
+GSE166388Anno <- GSE166388Anno %>%
+  dplyr::mutate(donor = str_remove(title, " epidermis_Human"),
+                diagnosis = `diagnosis:ch1`,
+                filename = paste0(geo_accession, ".CEL"),
+                gse = "GSE166388") 
+
+gdsGSE137218 <- getGEO("GSE137218")
+GSE137218Anno <- gdsGSE137218$GSE137218_series_matrix.txt.gz@phenoData@data
+
+GSE137218Anno <- GSE137218Anno %>%
+  dplyr::mutate(donor = str_extract(title, "[0-9]+"),
+                diagnosis = `patient diagnosis:ch1`,
+                visit = paste0("Day_", `day:ch1`),
+                filename = paste0(geo_accession, ".CEL"),
+                gse = "GSE137218") 
+
+save(GSE31652Anno, 
+     GSE166388Anno, 
+     GSE137218Anno,
+     file = file.path(geoDataDir, "GEO_Anno.RData"))
+
+
+```
+
+```{r colors}
+
+dosageColors <- c("Placebo" = "darkcyan", 
+                  "Ixekizumab" = "red")
+
+visitColors <- c("Week_0" = "purple",
+                 "Week_2" = "orange")
+
+visitShapes <- c("Week_0" = 15,
+                 "Week_2" = 8)
+
+gseShapes <- c("GSE166388" = 15,
+                 "GSE31652" = 1,
+               "GSE137218" = 8)
+
+studyGroupColors <- c("HC" = "darkcyan",
+                      "PS" = "red",
+                      "PS_aIL17" = "orange")
+```
+
+```{get_cel_files}
+GSE31652celFiles <- list.celfiles(
+  file.path(geoDataDir, "GSE31652_RAW"), full.names=TRUE)
+
+GSE31652rawData <- read.celfiles(GSE31652celFiles)
+
+GSE166388celFiles <- list.celfiles(
+  file.path(geoDataDir, "GSE166388_RAW"), full.names=TRUE)
+
+GSE166388rawData <- read.celfiles(GSE166388celFiles)
+
+#Match to get full filenames of GSE166388 data
+
+GSE166388Anno$filename <- colnames(GSE166388rawData)[match(str_extract(GSE166388Anno$filename, "GSM[0-9]{7}"),
+                                                           str_extract(colnames(GSE166388rawData), "GSM[0-9]{7}"))]
+
+
+GSE137218celFiles <- list.celfiles(
+  file.path(geoDataDir, "GSE137218_RAW"), full.names=TRUE)
+
+GSE137218rawData <- read.celfiles(GSE137218celFiles)
+
+GSE137218Anno$filename <- colnames(GSE137218rawData)[match(str_extract(GSE137218Anno$filename, "GSM[0-9]{7}"),
+                                                           str_extract(colnames(GSE137218rawData), "GSM[0-9]{7}"))]
+
+combAnno <- bind_rows(GSE31652Anno,
+                      GSE166388Anno,
+                      GSE137218Anno)
+
+combAnno <- combAnno %>%
+  dplyr::mutate(studyGroup = case_when(diagnosis == "healthy control" ~ "HC",
+                                       visit == "Day_4" ~ "PS_aIL17",
+                                       visit == "Day_14" ~ "PS_aIL17",
+                                       visit == "Day_42" ~ "PS_aIL17",
+                                       visit == "Day_84" ~ "PS_aIL17",
+                                       diagnosis == "psoriasis" ~ "PS",
+                                       visit == "Week_0" ~ "PS",
+                                       visit == "Week_2" & dosage == "Placebo" ~ "PS",
+                                       visit == "Week_2" & dosage == "Ixekizumab" ~ "PS_aIL17"),
+                studyGroup = factor(studyGroup,
+                                    levels = c("HC",
+                                               "PS",
+                                               "PS_aIL17")))
+combAnno <- combAnno %>%
+  dplyr::mutate(tissueType = case_when(studyGroup == "HC" ~ "NL",
+                                       studyGroup == "PS" & gse == "GSE166388" ~ "L",
+                                       gse == "GSE31652" ~ "L",
+                                       gse == "GSE137218" & `disease state (ls/nl):ch1` == "LS" ~ "L",
+                                       gse == "GSE137218" & `disease state (ls/nl):ch1` == "NL" ~ "NL"))
+```
+
+#Data processing
+
+The RMA algorithm (Robust Multi-array Average) in the R oligo package was used to background correct, normalize, and summarize the microarray data.A filter was applied to select protein-coding genes only for downstream analysis and only retain genes with a normalized signal of at least 3 in at least 10% of samples. 
+
+```{r rma}
+
+#Affymetrix bg sub/norm/summarization at once
+rmaGSE31652 <- rma(GSE31652rawData)
+rmaGSE166388 <- rma(GSE166388rawData)
+rmaGSE137218 <- rma(GSE137218rawData)
+
+```
+
+##Expression boxplots prior to RMA normalization
+
+The following plots summarize the probe signal distributions across samples prior to RMA normalization. 
+
+```{r raw_boxplots, fig.width=5, fig.height=3}
+
+oligo::boxplot(GSE31652rawData, "pm", target = "core",
+               main="GSE31652",
+               xlab = "Sample",
+               ylab = "Signal",
+               xaxt="n")
+
+```
+
+##Expression boxplots following RMA normalization
+
+The following plots summarize the probe signal distributions across samples after RMA normalization. 
+
+```{r raw_boxplots, fig.width=5, fig.height=3}
+
+oligo::boxplot(rmaGSE31652, "pm", 
+               target = "core",
+               main="GSE31652",
+               xlab = "Sample",
+               ylab = "Signal",
+               xaxt="n")
+
+```
+
+```{r annotate}
+
+rmaGSE31652 <- annotateEset(rmaGSE31652,
+                        hgu133a2.db)
+
+rmaGSE166388 <- annotateEset(rmaGSE166388,
+                             hgu133a2.db)
+
+rmaGSE137218 <- annotateEset(rmaGSE137218,
+                             clariomdhumantranscriptcluster.db)
+```
+
+```{r filtering}
+
+#Define a function to filter out lowly expressed genes
+gene_filter <- function(exp_in, 
+                        per_cutoff = 0.1,
+                        signal_cutoff = 3){
+  #Keep genes with signal of at least signal_cutoff in at least per_cutoff fraction of samples
+  #CPM normalize
+
+  #Filter out lowly expressed genes
+  keepRows <- rowSums((exp_in) >= signal_cutoff) >= per_cutoff*ncol(exp_in)
+  expFiltered <- exp_in[keepRows,]
+  
+  return(expFiltered)
+  
+}
+
+#Look at distributions of median expr
+# mediansrmaGSE31652 <- rowMedians(Biobase::exprs(rmaGSE31652))
+# 
+# histrmaGSE31652 <- hist(mediansrmaGSE31652, 100,
+#                         col = "cornsilk1",
+#                         freq = FALSE,
+#                         main = "Histogram of the median intensities",
+#                         border = "antiquewhite4",
+#                         xlab = "Median intensities")
+
+# mediansrmaGSE137218 <- rowMedians(Biobase::exprs(rmaGSE137218))
+# 
+# histrmaGSE137218 <- hist(mediansrmaGSE137218, 100,
+#                         col = "cornsilk1",
+#                         freq = FALSE,
+#                         main = "Histogram of the median intensities",
+#                         border = "antiquewhite4",
+#                         xlab = "Median intensities")
+
+expGSE31652 <- Biobase::exprs(rmaGSE31652)
+filteredGSE31652 <- gene_filter(expGSE31652)
+
+expGSE166388 <- Biobase::exprs(rmaGSE166388)
+filteredGSE166388 <- gene_filter(expGSE166388)
+
+expGSE137218 <- Biobase::exprs(rmaGSE137218)
+filteredGSE137218 <- gene_filter(expGSE137218)
+
+#Filter down to protein coding
+geneKey <- read.table(file.path(dataDir,
+                                 "EnsemblToHGNC_GRCh38.txt"), 
+                       header = TRUE,sep = "\t",na.strings = "")
+
+featuresGSE31652 <- fData(rmaGSE31652)
+featuresGSE166388 <- fData(rmaGSE166388)
+featuresGSE137218 <- fData(rmaGSE137218)
+
+featuresGSE31652$geneType <- geneKey$Gene.type[match(featuresGSE31652$SYMBOL,
+                                             geneKey$HGNC.symbol)]
+
+featuresGSE166388$geneType <- geneKey$Gene.type[match(featuresGSE166388$SYMBOL,
+                                             geneKey$HGNC.symbol)]
+
+featuresGSE137218$geneType <- geneKey$Gene.type[match(featuresGSE137218$SYMBOL,
+                                             geneKey$HGNC.symbol)]
+
+filteredPcGSE31652 <- filteredGSE31652[rownames(filteredGSE31652) %in% featuresGSE31652$PROBEID[featuresGSE31652$geneType == "protein_coding"],]
+
+filteredPcGSE166388 <- filteredGSE166388[rownames(filteredGSE166388) %in% featuresGSE166388$PROBEID[featuresGSE31652$geneType == "protein_coding"],]
+
+filteredPcGSE137218 <- filteredGSE137218[rownames(filteredGSE137218) %in% featuresGSE137218$PROBEID[featuresGSE137218$geneType == "protein_coding"],]
+
+
+#Collapse probes that map to the same gene
+
+collapseProbes <- function(expMat,
+                           featuresMat){
+geneCollapsed <- expMat %>%
+  as.data.frame()
+
+geneCollapsed$gene <- featuresMat$SYMBOL[match(rownames(geneCollapsed),
+                                                   featuresMat$PROBEID)]
+
+geneCollapsed <-  data.table::as.data.table(geneCollapsed) 
+
+geneCollapsed <-  geneCollapsed[,lapply(.SD,median),"gene"] %>%
+  as.data.frame() %>%
+  dplyr::filter(!is.na(gene)) %>%
+    magrittr::set_rownames(., value=.$gene)
+
+geneCollapsed$gene <- NULL
+geneCollapsed <- as.matrix(geneCollapsed)
+
+return(geneCollapsed)
+
+}
+
+genesGSE31652 <- collapseProbes(filteredPcGSE31652,
+                                featuresGSE31652)
+
+genesGSE166388 <- collapseProbes(filteredPcGSE166388,
+                                 featuresGSE166388)
+
+genesGSE137218 <- collapseProbes(filteredPcGSE137218,
+                                 featuresGSE137218)
+
+geneIntersection <- intersect(rownames(genesGSE31652),
+                               rownames(genesGSE166388))
+
+geneIntersection <- intersect(geneIntersection,
+                               rownames(genesGSE137218))
+
+genesGSE31652 <- genesGSE31652[geneIntersection,]
+
+#Make sure probes are in the same order in each dataset
+genesGSE166388 <- genesGSE166388[rownames(genesGSE31652),]
+genesGSE137218 <- genesGSE137218[rownames(genesGSE31652),]
+
+filteredPc <- cbind(genesGSE31652,
+                    genesGSE166388,
+                    genesGSE137218)
+```
+
+```{r combat}
+
+#Make a variable to adjust by that will correct PS lesional samples
+
+combAnno <- combAnno %>%
+  dplyr::mutate(sampleType = paste0(studyGroup, "_",tissueType))
+
+filteredPc <- filteredPc[, combAnno$filename]
+
+
+modelMat = model.matrix(~sampleType, data=combAnno)
+batchCorExp <- ComBat(as.matrix(filteredPc),
+                      batch = combAnno$gse,
+                      mod = modelMat)
+
+
+```
+
+#Principal component analysis 
+
+```{r pca}
+
+combAnno <- combAnno %>%
+  dplyr::mutate(sampleType = case_when(studyGroup == "HC" ~ "HC",
+                                       studyGroup == "PS" & tissueType == "NL" ~ "PS_NonLesional",
+                                       studyGroup == "PS" & is.na(visit) ~ "PS_D0",
+                                       studyGroup == "PS" & visit == "Week_0" ~ "PS_D0",
+                                       studyGroup == "PS" & visit == "Day_0" & tissueType == "L" ~ "PS_D0",
+                                       studyGroup == "PS" & visit == "Week_2" ~ "PS_D14_Placebo",
+                                       studyGroup == "PS_aIL17" & visit == "Week_2" ~ "PS_D14_Ixe",
+                                       studyGroup == "PS_aIL17" & visit == "Day_4" ~ "PS_D4_Sec",
+                                       studyGroup == "PS_aIL17" & visit == "Day_14" ~ "PS_D14_Sec",
+                                       studyGroup == "PS_aIL17" & visit == "Day_42" ~ "PS_D42_Sec",
+                                       studyGroup == "PS_aIL17" & visit == "Day_84" ~ "PS_D84_Sec"),
+                sampleType = factor(sampleType,
+                                    levels = c("HC",
+                                               "PS_NonLesional",
+                                               "PS_D0",
+                                               "PS_D14_Placebo",
+                                               "PS_D4_Sec",
+                                               "PS_D14_Ixe",
+                                               "PS_D14_Sec",
+                                               "PS_D42_Sec",
+                                               "PS_D84_Sec")))
+
+sampleTypeColors <- c("HC" = "black",
+                      "PS_NonLesional" = "grey",
+                      "PS_D0" = "red",
+                      "PS_D14_Placebo" = "orange",
+                      "PS_D4_Sec" = "gold2",
+                      "PS_D14_Ixe" = "darkcyan",
+                      "PS_D14_Sec" = "blue",
+                      "PS_D42_Sec" = "purple",
+                      "PS_D84_Sec" = "pink")
+
+pca = prcomp(t(batchCorExp), center=TRUE, scale=FALSE)
+
+#Get PCA resutls and merge with sample information stored in metrics
+sumPca = summary(pca)
+pcaScores = as.data.frame(pca$x)
+
+pdatscores <- merge(combAnno, pcaScores, by.x = "filename", by.y="row.names")
+pc1Lab = paste("PC1 (", round(100*sumPca$importance[2, 1], 1),  "%)", sep="")
+pc2Lab = paste("PC2 (", round(100*sumPca$importance[2, 2], 1),  "%)", sep="")
+pc3Lab = paste("PC3 (", round(100*sumPca$importance[2, 3], 1),  "%)", sep="")
+pc4Lab = paste("PC4 (", round(100*sumPca$importance[2, 4], 1),  "%)", sep="")
+pc5Lab = paste("PC5 (", round(100*sumPca$importance[2, 5], 1),  "%)", sep="")
+pc6Lab = paste("PC6 (", round(100*sumPca$importance[2, 6], 1),  "%)", sep="")
+
+```
+
+#PC1 vs PC2
+
+```{r pc1_pc2}
+
+plotLayers <- list(labs(x = pc1Lab, 
+                        y = pc2Lab),
+                    theme(aspect.ratio = 1))  
+
+
+gPCADonor <- ggplot() + 
+  geom_point(data = pdatscores, 
+             aes(x=PC1, 
+                 y=PC2, 
+                 color = donor)) +
+  
+  plotLayers
+
+gPCA <- ggplot() + 
+  geom_point(data = pdatscores, 
+             aes(x=PC1, 
+                 y=PC2, 
+                 color = studyGroup,
+                 shape = gse)) +
+  scale_color_manual(values = studyGroupColors,
+                     name= "Study Group") +
+  scale_shape_manual(values = gseShapes,
+                     name = "Dataset") +
+  plotLayers
+
+print(gPCA)
+
+pdf(file.path(plotsDir, "PCA_CombinedGSE.pdf"),
+    height = 4,
+    width = 6)
+
+print(gPCA)
+invisible(dev.off())
+
+
+gPCA <- ggplot() + 
+  geom_point(data = pdatscores, 
+             aes(x=PC1, 
+                 y=PC2, 
+                 color = sampleType,
+                 shape = gse)) +
+  scale_color_manual(values = sampleTypeColors,
+                     name= "Group") +
+  scale_shape_manual(values = gseShapes,
+                     name = "Dataset") +
+  plotLayers
+
+print(gPCA)
+
+pdf(file.path(plotsDir, "PCA_CombinedGSEThreeSamples.pdf"),
+    height = 7,
+    width = 7)
+
+print(gPCA)
+invisible(dev.off())
+```
+
+#Differential expression
+
+```{r make_volcano_plots}
+
+plot_volcano <- function(top_table_in,
+                         fc_cutoff = 1,
+                         p_cutoff = 0.05,
+                         fc_for_anno = 2.5,
+                         p_for_anno = 0.1,
+                         y_max = 2.5,
+                         title = "",
+                         color_values = c("darkcyan", "red"),
+                         color_labels = NULL,
+                         anno_type = "or"){
+  
+  #top_table_in$gene_name <- rownames(top_table_in)
+  top_table_in$gene_name <- top_table_in$SYMBOL
+
+  if(anno_type == "or"){
+    selected_genes <- top_table_in %>%
+  dplyr::filter(abs(logFC) > fc_for_anno | adj.P.Val < p_for_anno)
+  }
+  
+  if(anno_type == "and"){
+    selected_genes <- top_table_in %>%
+  dplyr::filter(abs(logFC) > fc_for_anno & adj.P.Val < p_for_anno)
+  }
+  
+  if(anno_type == "top20"){
+    selected_genes <- top_table_in[1:20,]
+  }
+
+g_volcano <- ggplot(data = top_table_in, aes(x=logFC, y=-log10(adj.P.Val), color = logFC>0)) +
+  geom_point(alpha=0.7, size=2.5, shape = 19) +
+  #theme(legend.position = "none") +
+  scale_color_manual(values = color_values, name = "", labels = color_labels)+
+  xlab("log2 fold change") + ylab("-log10 FDR")+ ggtitle(title) +
+  geom_vline(xintercept=fc_cutoff, color="black", linetype="dotted",size=1.0) +
+  geom_vline(xintercept=-1*fc_cutoff, color="black", linetype="dotted",size=1.0)+
+  geom_hline(yintercept=-log10(p_cutoff), color="black",linetype="dotted",size=1.0)+
+   geom_text_repel(data = selected_genes,
+             aes(x=logFC, y=-log10(adj.P.Val),label=gene_name), 
+             size=2.5, vjust=1,hjust=0.5, color="black", max.overlaps = Inf)+
+  ylim(c(0,y_max))+
+  theme(text = element_text(size=12))
+
+return(g_volcano)
+
+}
+```
+
+```{r de_functions}
+save_DE_table <- function(top_genes, out_file){
+  top_genes$Gene <- rownames(top_genes)
+  top_genes <- top_genes %>%
+    dplyr::rename(log2FoldChange = logFC,
+                  pValue = P.Value,
+                  MultipleTestingCorrectedFDR = adj.P.Val) %>%
+    dplyr::select(Gene, log2FoldChange, pValue, MultipleTestingCorrectedFDR)
+  
+  write.csv(top_genes,
+            file.path(tablesDir,
+                      out_file),
+            row.names = F,
+            quote=F)
+}
+
+save_sig_table <- function(top_genes, 
+                           out_file,
+                           fdr_cut = 0.05,
+                           lfc_cut = 1){
+  
+  top_genes$Gene <- rownames(top_genes)
+  sig_genes <- top_genes %>%
+    dplyr::rename(log2FoldChange = logFC,
+                  pValue = P.Value,
+                  MultipleTestingCorrectedFDR = adj.P.Val) %>%
+    dplyr::filter(MultipleTestingCorrectedFDR <= fdr_cut,
+                  abs(log2FoldChange) >= lfc_cut) %>%
+    dplyr::select(Gene, log2FoldChange, pValue, MultipleTestingCorrectedFDR)
+  
+  write.csv(sig_genes,
+            file.path(tablesDir,
+                      out_file),
+            row.names = F,
+            quote=F)
+}
+
+get_sig_genes <- function(top_genes,
+                          lfc_cutoff = 1,
+                          fdr_cutoff = 0.05){
+  
+  if(!("ID" %in% colnames(top_genes))){
+    top_genes$gene <- rownames(top_genes)
+  }
+  
+  if("SYMBOL" %in% colnames(top_genes)){
+    top_genes$gene <- top_genes$SYMBOL
+  }
+  
+  if("Gene" %in% colnames(top_genes)){
+    top_genes$gene <- top_genes$Gene
+  }
+  
+  
+  sig_table <- top_genes %>%
+    dplyr::filter(abs(logFC) > lfc_cutoff,
+                  adj.P.Val < fdr_cutoff)
+  
+  sig_genes <- sig_table$gene
+  return(sig_genes)
+
+}
+
+get_top_n_genes <- function(top_genes,
+                            n = 20){
+  
+  top_genes$gene <- rownames(top_genes)
+  
+  top_n_table <- top_genes %>%
+    dplyr::arrange(adj.P.Val)
+  
+  top_n_table <- top_n_table[1:n,]
+  
+  top_n_genes <- top_n_table$gene
+  
+  return(top_n_genes)
+
+}
+
+save_sig_table_F <- function(top_genes, 
+                           out_file,
+                           fdr_cut = 0.05,
+                           lfc_cut = 1){
+  
+  top_genes$Gene <- rownames(top_genes)
+  sig_genes <- top_genes %>%
+    dplyr::rename(pValue = P.Value,
+                  MultipleTestingCorrectedFDR = adj.P.Val) %>%
+    dplyr::filter(MultipleTestingCorrectedFDR <= fdr_cut)
+  
+  write.csv(sig_genes,
+            file.path(tablesDir,
+                      out_file),
+            row.names = F,
+            quote=F)
+}
+
+```
+
+Gene expression was modeled as a function of treatment group and visit, with an interaction term. Patient identity was modeled as a random effect. 
+
+```{r de_combined}
+
+#Order counts and design 
+batchCorExp <- batchCorExp[ ,combAnno$filename]
+featuresGenes <- data.frame(SYMBOL = rownames(batchCorExp))
+
+rownames(featuresGenes) <- featuresGenes$SYMBOL
+
+designMat <- model.matrix(~combAnno$sampleType)
+
+#simplify columns names so contrasts are easier to make later
+colnames(designMat) <- colnames(designMat) %>%
+  str_remove_all("combAnno|sampleType") %>%
+  str_remove_all("\\$|\\(|\\)") %>%
+  str_replace_all(":", "_") %>%
+  str_replace_all("-", "_")
+
+
+#Get model fits that treat patient ID as a random effect
+corfit <- duplicateCorrelation(batchCorExp,
+                               designMat,
+                               block=combAnno$donor)
+
+ 
+vfit<- lmFit(batchCorExp, 
+                 designMat,
+                 block=combAnno$donor,
+                 correlation=corfit$consensus)
+
+
+vfitEb <- eBayes(vfit)
+
+#Make contrasts
+contrast <- makeContrasts(
+  "PS_D0",
+  "PS_D4_Sec",
+  "PS_D14_Ixe",
+  "PS_D14_Sec" ,
+  "PS_D42_Sec",
+  "PS_D84_Sec",
+  "PS_NonLesional",
+  "PS_D0-PS_D84_Sec",
+  levels=designMat)
+
+contrastFit <- contrasts.fit(vfitEb, contrast)
+contrastFit <- eBayes(contrastFit)
+
+```
+
+```{r top_tables, fig.width=11, fig.height=15}
+
+topGenesPSD0vsHC <- topTable(contrastFit, 
+                                   coef = "PS_D0", 
+                                   sort.by = "P", 
+                                   number = Inf)
+
+topGenesPSD4vsHC <- topTable(contrastFit, 
+                                   coef = "PS_D4_Sec", 
+                                   sort.by = "P", 
+                                   number = Inf)
+
+topGenesPSD14vsHC <- topTable(contrastFit, 
+                                   coef = "PS_D14_Sec", 
+                                   sort.by = "P", 
+                                   number = Inf)
+
+topGenesPSD14IxevsHC <- topTable(contrastFit, 
+                                   coef = "PS_D14_Ixe", 
+                                   sort.by = "P", 
+                                   number = Inf)
+
+topGenesPSD42vsHC <- topTable(contrastFit, 
+                                   coef = "PS_D42_Sec", 
+                                   sort.by = "P", 
+                                   number = Inf)
+
+topGenesPSD84vsHC <- topTable(contrastFit, 
+                                   coef = "PS_D84_Sec", 
+                                   sort.by = "P", 
+                                   number = Inf)
+
+topGenesPSD0vsPSD84 <- topTable(contrastFit, 
+                                   coef = "PS_D0-PS_D84_Sec", 
+                                   sort.by = "P", 
+                                   number = Inf)
+
+topGenesPSD0NonLesionalvsHC <- topTable(contrastFit, 
+                                   coef = "PS_NonLesional", 
+                                   sort.by = "P", 
+                                   number = Inf)
+
+
+```
+
+# Investigtion of PS disregulated genes
+
+What genes are differentially expressed in PS vs HC? How do these change with treatment?
+
+```{r ps_vs_hc}
+
+#Get genes that are differentially expressed in PS vs HC
+sigGenesPSD0vsHC <- get_sig_genes(topGenesPSD0vsHC,
+                                lfc_cutoff = 1,
+                                fdr_cutoff = 0.05)
+
+
+hmapCounts <- batchCorExp[sigGenesPSD0vsHC,combAnno$filename]
+
+hmapAnno <- HeatmapAnnotation(Group = combAnno$sampleType,
+                              col = list(Group = sampleTypeColors))
+
+scaledCounts <- t(scale(t(hmapCounts)))
+
+hmap <- Heatmap(scaledCounts,
+                name = "Row z-score",
+                top_annotation = hmapAnno,
+                show_column_names = FALSE,
+                show_row_names = FALSE)
+
+pdf(file.path(plotsDir, "Heatmap_ThreeDatasets_UntreatedPSvsHCGenes.pdf"),
+    width = 7,
+    height = 6)
+
+draw(hmap)
+
+invisible(dev.off())
+
+
+
+```
+
+What genes are differentially expressed in PS vs HC that are also differentially expressed in PS_aIL17 vs HC? Which genes do not return to baseline levels with treatment. 
+
+```{r ps_vs_hc_return_to_baseline}
+
+#Get genes that are differentially expressed after 84 days of treatment vs HC
+sigGenesPSD84vsHC <- get_sig_genes(topGenesPSD84vsHC,
+                                      lfc_cutoff = 1,
+                                      fdr_cutoff = 0.05)
+
+#Get genes that are differentially expressed in PS vs PS_aIL17
+
+sigGenesPSD0vsPSD84 <- get_sig_genes(topGenesPSD0vsPSD84,
+                                lfc_cutoff = 1,
+                                fdr_cutoff = 0.05)
+
+#Make a Venn diagram of overlaps
+
+gVenn <- ggvenn(list("PS vs HC" = sigGenesPSD0vsHC,
+                    "D84 vs HC" = sigGenesPSD84vsHC,
+                    "PS vs D84" = sigGenesPSD0vsPSD84),
+                show_percentage = FALSE)
+
+pdf(file.path(plotsDir, "Venn_HC_PSD0_PSD84.pdf"),
+    width = 5,
+    height = 5)
+
+print(gVenn)
+
+invisible(dev.off())
+
+
+#Heatmap of genes that don't return to normal.
+#Define these as genes that are differentially expressed in PS vs HC and PS_aIL17 vs HC
+
+PSandAIL17DEgenes <- intersect(sigGenesPSD84vsHC,
+                                  sigGenesPSD0vsHC)
+
+hmapCounts <- batchCorExp[PSandAIL17DEgenes,combAnno$filename]
+
+hmapAnno <- HeatmapAnnotation(Group = combAnno$sampleType,
+                              col = list(Group = sampleTypeColors))
+
+scaledCounts <- t(scale(t(hmapCounts)))
+
+hmap <- Heatmap(scaledCounts,
+                name = "Row z-score",
+                top_annotation = hmapAnno,
+                show_column_names = FALSE,
+                show_row_names = FALSE)
+
+pdf(file.path(plotsDir, "Heatmap_IntersectPSD0vsHCandAIL17D84vsHCDEgenes_FDR0_05.pdf"),
+    width = 5,
+    height = 6)
+
+draw(hmap)
+
+invisible(dev.off())
+
+#Make a table of DE genes
+
+
+geneDETable <- data.frame(gene = rownames(topGenesPSD0vsHC),
+                          PSD0vsHC_logFC = topGenesPSD0vsHC$logFC,
+                          PSD0vsHC_FDR = topGenesPSD0vsHC$adj.P.Val,
+                          PSD0vsHC_DE = rownames(topGenesPSD0vsHC) %in% sigGenesPSD0vsHC,
+                          PSD84vsHC_logFC = topGenesPSD84vsHC$logFC[match(rownames(topGenesPSD0vsHC), rownames(topGenesPSD84vsHC))],
+                          PSD84vsHC_FDR = topGenesPSD84vsHC$adj.P.Val[match(rownames(topGenesPSD0vsHC), rownames(topGenesPSD84vsHC))],
+                          PSD84vsHC_DE = rownames(topGenesPSD84vsHC) %in% sigGenesPSD84vsHC,
+                          PSD0vsPSD84_logFC = topGenesPSD0vsPSD84$logFC[match(rownames(topGenesPSD0vsHC), rownames(topGenesPSD0vsPSD84))],
+                          PSvsPSonAntiIL17_FDR = topGenesPSD0vsPSD84$adj.P.Val[match(rownames(topGenesPSD0vsHC), rownames(topGenesPSD0vsPSD84))],
+                          PSvsPSonAntiIL17_DE = rownames(topGenesPSD0vsPSD84) %in% sigGenesPSD0vsPSD84)
+
+write.table(geneDETable,
+            file = file.path(tablesDir, "Psoriasis_HC_D84_D0_DEgenes.txt"),
+            sep = "\t",
+            row.names = FALSE,
+            quote = FALSE)
+
+#Write table of intersection of genes
+
+write.table(PSandAIL17DEgenes,
+            file = file.path(tablesDir, "PSandDay84AIL17DEgenes.txt"),
+            row.names = FALSE,
+            quote = FALSE)
+
+```
+
+
+# Plots of gene set scores 
+
+```{r open_gene_sets}
+
+read_all_sheets = function(xlsxFile, colNamesTF = FALSE,...) {
+  sheet_names = openxlsx::getSheetNames(xlsxFile)
+  sheet_list = as.list(rep(NA, length(sheet_names)))
+  names(sheet_list) = sheet_names
+  for (sn in sheet_names) {
+    sheet_list[[sn]] = openxlsx::read.xlsx(xlsxFile, sheet=sn, colNames = colNamesTF,...)
+  }
+  return(sheet_list)
+}
+
+
+supKCGeneSets <- read_all_sheets(file.path(tablesDir, "SupStimulatedKCGeneSets.xlsx"), colNamesTF = FALSE)
+cytokineKCGeneSets <- read_all_sheets(file.path(tablesDir, "CytokineStimulatedKCGeneSets.xlsx"), colNamesTF = FALSE)
+
+#Filter to cytokine gene sets of interest at 24 hours
+
+cytokineKCGeneSets <- cytokineKCGeneSets[c("IFNG_24hr",
+                        "IL13_24hr",
+                        "IL17A_24hr",
+                        "IL22_24hr",
+                        "IL26_24hr")]
+
+names(cytokineKCGeneSets) <- str_remove(names(cytokineKCGeneSets), "_24hr")
+
+```
+
+```{r gene_set_heatmap}
+
+geneSetHeatmapScores <- function(geneSetObj,
+                           countsObj){
+  
+  # roastObj$geneSet <- rownames(roastObj)
+  # 
+  # roastObj <- roastObj %>%
+  #   dplyr::mutate(propSigned = case_when(Direction == "Up" ~ PropUp,
+  #                                        Direction == "Down" ~ -1*PropDown)) %>%
+  #   dplyr::arrange(FDR) %>%
+  #   dplyr::mutate(geneSet = factor(geneSet),
+  #                 geneSet = fct_reorder(geneSet,
+  #                                       FDR))
+  
+  selectedGeneSets <- names(geneSetObj)
+  selectedGenes <- geneSetObj[selectedGeneSets] 
+  
+  #Get the mean gene set score for all libs 
+  
+  scoreMatrix <- matrix(data=NA, 
+                        nrow=length(selectedGeneSets), 
+                        ncol=ncol(countsObj))
+  
+  for(i in 1:length(selectedGeneSets)){
+    
+      setGenes <- geneSetObj[[selectedGeneSets[i]]]
+      setGenes <- setGenes[!is.na(setGenes)]
+      setGenes <- setGenes[setGenes != ""]
+      setGenes <- setGenes[setGenes %in% rownames(countsObj)]
+        
+      countsObjSubset <- countsObj[setGenes,]
+    
+      setScores <- apply(countsObjSubset, 2, function(x) exp(mean(log(x))))
+      
+      scoreMatrix[i,] <- t(setScores)
+    
+  }
+  
+  rownames(scoreMatrix) <- selectedGeneSets
+  colnames(scoreMatrix) <- colnames(countsObj)
+    
+  return(scoreMatrix)
+}
+```
+
+```{r get_scores}
+
+scoresSupKC <- geneSetHeatmapScores(supKCGeneSets,
+                     batchCorExp) %>% t() %>% as.data.frame()
+
+scoresSupKC$filename <- rownames(scoresSupKC)
+
+scoresCytokineKC <- geneSetHeatmapScores(cytokineKCGeneSets,
+                     batchCorExp) %>% t() %>% as.data.frame()
+
+scoresCytokineKC$filename <- rownames(scoresCytokineKC)
+
+annoSupScores <- left_join(combAnno,
+                           scoresSupKC)
+
+annoCytokineScores <- left_join(combAnno,
+                           scoresCytokineKC)
+
+```
+
+```{r points_all}
+
+pd <- position_dodge(0.1)
+
+gSupVisits <- annoSupScores %>%
+  pivot_longer(cols =  c("Blood CD4+ Th1",
+                        "Blood CD4+ Th2",
+                        "Blood CD4+ Th17",
+                        "Blood CD4+ Th22",
+                        "Blood CD4+ CD103+"),
+               names_to = "sup",
+               values_to = "score") %>%
+ggplot(aes(x = sampleType,
+             y = score,
+             group = donor,
+           color = sampleType)) +
+  #geom_boxplot(outlier.shape = NA) +
+  scale_color_manual(values = sampleTypeColors) +
+  geom_point(position = pd) +
+   geom_line(position = pd) +
+   ylim(c(6,8))+
+  labs(x = "",
+       y = "Gene set score",
+       color = "") +
+   theme(axis.text.x=element_text(angle=60, hjust=1),
+         axis.text=element_text(size=10),
+            axis.title=element_text(size=10)) +
+  facet_wrap(~sup)
+
+pdf(file.path(plotsDir, 
+              "DotPlot_SupKCGeneSetScoresThreePSGroups.pdf"),
+    height = 5,
+    width = 8)
+
+print(gSupVisits)
+
+invisible(dev.off())
+
+pd <- position_dodge(0.1)
+
+#Play with continuous sample type color schemes
+
+contSampleColors <- rcartocolor::carto_pal(length(sampleTypeColors),"Temps")
+names(contSampleColors) <- names(sampleTypeColors) 
+#contSampleColors["HC"] <- "black"
+
+gSupVisits <- annoSupScores %>%
+  pivot_longer(cols =  c("Blood CD4+ Th1",
+                        "Blood CD4+ Th2",
+                        "Blood CD4+ Th17",
+                        "Blood CD4+ Th22",
+                        "Blood CD4+ CD103+"),
+               names_to = "sup",
+               values_to = "score") %>%
+ggplot(aes(x = sampleType,
+             y = score,
+             group = donor,
+           color = sampleType)) +
+  #geom_boxplot(outlier.shape = NA) +
+  scale_color_manual(values = contSampleColors) +
+  geom_point(position = pd) +
+   geom_line(position = pd) +
+   ylim(c(6,8))+
+  labs(x = "",
+       y = "Gene set score",
+       color = "") +
+   theme(axis.text.x=element_text(angle=60, hjust=1),
+         axis.text=element_text(size=10),
+            axis.title=element_text(size=10)) +
+  facet_wrap(~sup)
+
+pdf(file.path(plotsDir, 
+              "DotPlot_SupKCGeneSetScoresThreePSGroups_Purple.pdf"),
+    height = 5,
+    width = 8)
+
+print(gSupVisits)
+
+invisible(dev.off())
+```
+
+```{r compute_gene_set_score_stats}
+
+scoreStats <- annoSupScores %>%
+  pivot_longer(cols =  c("Blood CD4+ Th1",
+                        "Blood CD4+ Th2",
+                        "Blood CD4+ Th17",
+                        "Blood CD4+ Th22",
+                        "Blood CD4+ CD103+"),
+               names_to = "sup",
+               values_to = "score") %>%
+  dplyr::group_by(sup) %>%
+  rstatix::t_test(score ~ sampleType, 
+                  p.adjust.method = "fdr",
+                  ref.group = "HC")
+
+write.csv(scoreStats,
+          file = file.path(tablesDir, "PS_supernatantGeneSetScores_StatComparisonsRelativeToHC.csv"),
+          row.names = F)
+
+scoreStats <- annoSupScores %>%
+  pivot_longer(cols =  c("Blood CD4+ Th1",
+                        "Blood CD4+ Th2",
+                        "Blood CD4+ Th17",
+                        "Blood CD4+ Th22",
+                        "Blood CD4+ CD103+"),
+               names_to = "sup",
+               values_to = "score") %>%
+  dplyr::group_by(sup) %>%
+  rstatix::t_test(score ~ sampleType, 
+                  p.adjust.method = "fdr",
+                  ref.group = "PS_D0")
+
+write.csv(scoreStats,
+          file = file.path(tablesDir, "PS_supernatantGeneSetScores_StatComparisonsRelativeToDay0Psoriasis.csv"),
+          row.names = F)
+
+
+scoreStats <- annoSupScores %>%
+  pivot_longer(cols =  c("Blood CD4+ Th1",
+                        "Blood CD4+ Th2",
+                        "Blood CD4+ Th17",
+                        "Blood CD4+ Th22",
+                        "Blood CD4+ CD103+"),
+               names_to = "sup",
+               values_to = "score") %>%
+  dplyr::group_by(sup) %>%
+  rstatix::t_test(score ~ sampleType, 
+                  p.adjust.method = "fdr")
+
+write.csv(scoreStats,
+          file = file.path(tablesDir, "PS_supernatantGeneSetScores_StatsAllComparisons.csv"),
+          row.names = F)
+
+supScoreStats <- gSupVisits <- annoSupScores %>%
+   #dplyr::filter((studyGroup == "HC") | (dosage == "Ixekizumab")) %>%
+  dplyr::filter(!((studyGroup == "PS") & (visit == "Week_2"))) %>%
+   dplyr::mutate(visitGroup = case_when(studyGroup == "HC" ~ "HC",
+                                         visit == "Week_0" ~ "PS, baseline",
+                                         visit == "Week_2" ~ "PS, aIL17",
+                                        studyGroup == "PS" ~ "PS, ")) %>%
+  pivot_longer(cols =  c("Blood CD4+ Th1",
+                        "Blood CD4+ Th2",
+                        "Blood CD4+ Th17",
+                        "Blood CD4+ Th22",
+                        "Blood CD4+ CD103+"),
+               names_to = "sup",
+               values_to = "score") %>%
+  dplyr::group_by(sup) %>%
+  dplyr::summarise(pvaluesHCvsaIL17 = t.test(score[visitGroup == "HC"],
+                                       score[visitGroup == "PS, aIL17"])$p.value,
+                   pvaluesHCvsPS = t.test(score[visitGroup == "HC"],
+                                       score[visitGroup == "PS, baseline"])$p.value,
+                   pvaluesaIL17vsPS = t.test(score[visitGroup == "PS, aIL17"],
+                                       score[visitGroup == "PS, baseline"])$p.value) %>%
+  pivot_longer(cols = starts_with("pvalues"),
+               names_to = "comparison",
+               values_to = "pValue") %>%
+  dplyr::ungroup() %>%
+  dplyr::mutate(FDR = p.adjust(pValue, method = "fdr"),
+                bonferroni = p.adjust(pValue, method = "bonferroni"))
+
+```
+
+```{r examine_overlap}
+
+#Examine overlap of genes that respond to treatment (overlap of HC vs PS day 0 and PS day 0 vs PS day 84)
+
+sigGenesPSD0vsHC <- get_sig_genes(topGenesPSD0vsHC,
+                                lfc_cutoff = 1,
+                                fdr_cutoff = 0.05)
+
+sigGenesPSD0vsPSD84 <- get_sig_genes(topGenesPSD0vsPSD84,
+                                lfc_cutoff = 1,
+                                fdr_cutoff = 0.05)
+
+#Make an Euler diagram (proportional Venn)
+
+#Only look at Th sup genes detected in the microarray
+
+thGenes <- intersect(supKCGeneSets$`Blood CD4+ Th17`$X1, rownames(batchCorExp))
+
+eulerData <- list("HcVsPs" = sigGenesPSD0vsHC,
+                        "D84SecVsPs" = sigGenesPSD0vsPSD84,
+                        "Th17SupGeneSet" = thGenes)
+
+eulerData <- eulerr::euler(eulerData)
+
+
+pdf(file.path(plotsDir,
+              "EulerDiagram_PsVsHC_PsVsDay84_Th17Sig.pdf"))
+
+plot(eulerData,
+     quantities = TRUE,
+     fill = "transparent",
+     lty = c(1,2,4),
+     labels = list(font = 4)
+)
+
+invisible(dev.off())
+
+#Run with all Th17 de genes
+
+supKCSigStats <- read_excel(file.path(tablesDir,
+                                      "SupStimulatedKeratinocyteStatisticsVsUnstimControl.xlsx"),
+                            sheet = "BloodCD4Th17VMediaKer")
+
+# supKCSigStats <- read_excel(file.path(tablesDir,
+#                                       "SupStimulatedKeratinocyteStatistics.xlsx"),
+#                             sheet = "BloodCD4Th17VAllCD4sKer")
+
+rownames(supKCSigStats) <- supKCSigStats$`...1`
+
+sigGenesTh17 <- intersect(get_sig_genes(supKCSigStats,
+                                lfc_cutoff = 1,
+                                fdr_cutoff = 0.05), rownames(batchCorExp))
+
+eulerData <- list("HcVsPs" = sigGenesPSD0vsHC,
+                        "D84SecVsPs" = sigGenesPSD0vsPSD84,
+                        "Th1DEGenes" = sigGenesTh17)
+
+eulerData <- eulerr::euler(eulerData)
+
+
+pdf(file.path(plotsDir,
+              "EulerDiagram_PsVsHC_PsVsDay84_Th17VsUnstimControl.pdf"))
+
+plot(eulerData,
+     quantities = TRUE,
+     fill = "transparent",
+     lty = c(1,2,4),
+     labels = list(font = 4)
+)
+
+invisible(dev.off())
+
+
+```
+
+```{r volcano_plots_highlight_genes}
+
+plot_volcano_set_genes <- function(top_table_in,
+                                   gene_list,
+                         fc_cutoff = 1,
+                         p_cutoff = 0.05,
+                         title = "",
+                         y_max = 20,
+                         color_values = c("darkcyan", "red"),
+                         color_labels = c("HC", "PS")){
+  
+  #top_table_in$gene_name <- rownames(top_table_in)
+  top_table_in$gene_name <- top_table_in$SYMBOL
+  
+    selected_genes <- top_table_in %>%
+      dplyr::filter(gene_name %in% gene_list)
+
+g_volcano <- ggplot(data = top_table_in, aes(x=logFC, y=-log10(adj.P.Val), color = logFC>0)) +
+  geom_point(alpha=0.7, size=2.5, shape = 19) +
+  #theme(legend.position = "none") +
+  scale_color_manual(values = color_values, name = "", labels = color_labels)+
+  xlab("log2 fold change") + ylab("-log10 FDR")+ ggtitle(title) +
+  #geom_vline(xintercept=fc_cutoff, color="black", linetype="dotted",size=1.0) +
+  #geom_vline(xintercept=-1*fc_cutoff, color="black", linetype="dotted",size=1.0)+
+  geom_hline(yintercept=-log10(p_cutoff), color="black",linetype="dotted",size=1.0)+
+    geom_point(data = selected_genes,
+             aes(x=logFC, y=-log10(adj.P.Val)),
+             color = "black", size=2.5, shape = 19) +
+   geom_text_repel(data = selected_genes[1:20,],
+             aes(x=logFC, y=-log10(adj.P.Val),label=gene_name), 
+             size=3, vjust=1,hjust=0.5, color="black", max.overlaps = Inf)+
+  ylim(c(0,y_max))+
+  theme(text = element_text(size=16))
+
+return(g_volcano)
+
+}
+
+volcanoHeight <- 400
+volcanoWidth <- 500
+
+# gHCvsPSTh1 <- plot_volcano_set_genes(topGenesPSvsHC,
+#              supKCGeneSets$`Blood CD4+ Th1`$X1)
+# gHCvsPSTh2 <- plot_volcano_set_genes(topGenesPSvsHC,
+#              supKCGeneSets$`Blood CD4+ Th2`$X1)
+# gHCvsPSTh17 <- plot_volcano_set_genes(topGenesPSvsHC,
+#              supKCGeneSets$`Blood CD4+ Th17`$X1)
+# gHCvsPSTh22 <- plot_volcano_set_genes(topGenesPSvsHC,
+#              supKCGeneSets$`Blood CD4+ Th22`$X1)
+# gHCvsPSCD103 <- plot_volcano_set_genes(topGenesPSvsHC,
+#              supKCGeneSets$`Blood CD4+ CD103+`$X1)
+# 
+# png(file.path(plotsDir, 
+#               "Volcano_PSvsHC_BloodTh1PosSig.png"),
+#     height = volcanoHeight, 
+#     width = volcanoWidth)
+# 
+# print(gHCvsPSTh1)
+# 
+# invisible(dev.off())
+# 
+# png(file.path(plotsDir, 
+#               "Volcano_PSvsHC_BloodTh2PosSig.png"),
+#     height = volcanoHeight, 
+#     width = volcanoWidth)
+# 
+# print(gHCvsPSTh2)
+# 
+# invisible(dev.off())
+# 
+# 
+# png(file.path(plotsDir, 
+#               "Volcano_PSvsHC_BloodTh17PosSig.png"),
+#     height = volcanoHeight, 
+#     width = volcanoWidth)
+# 
+# print(gHCvsPSTh17)
+# 
+# invisible(dev.off())
+# 
+# png(file.path(plotsDir, 
+#               "Volcano_PSvsHC_BloodTh22PosSig.png"),
+#     height = volcanoHeight, 
+#     width = volcanoWidth)
+# 
+# print(gHCvsPSTh22)
+# 
+# invisible(dev.off())
+# 
+# png(file.path(plotsDir, 
+#               "Volcano_PSvsHC_BloodCD103PosSig.png"),
+#     height = volcanoHeight, 
+#     width = volcanoWidth)
+# 
+# print(gHCvsPSCD103)
+# 
+# invisible(dev.off())
+
+```
+
+```{r sup_ps_intersect_hmap}
+
+sigGenes <- intersect(supKCGeneSets$`Blood CD4+ CD103+`$X1,
+                      get_sig_genes(topGenesPSD0vsHC))
+
+sigGenes <- sigGenes[sigGenes %in% rownames(batchCorExp)]
+
+#For consistency with dot plots and to avoid repeated samples, remove PS untreated wk 2 profiles
+hmapAnno <- combAnno %>%
+   #dplyr::filter((studyGroup == "HC") | (dosage == "Ixekizumab")) %>%
+  dplyr::filter(!((studyGroup == "PS") & (visit == "Week_2"))) 
+
+hmapCounts <- batchCorExp[sigGenes,hmapAnno$filename]
+
+columnAnno <- HeatmapAnnotation(Group = hmapAnno$studyGroup,
+                                col = list(Group = studyGroupColors)) 
+
+scaledCounts <- t(scale(t(hmapCounts))) 
+
+hmap <- Heatmap(scaledCounts,
+                name = "row z-score",
+                cluster_columns = TRUE,
+                top_annotation = columnAnno,
+                show_column_names = FALSE,
+                show_row_names = TRUE)
+
+
+draw(hmap)
+
+pdf(file.path(plotsDir, 
+              "Heatmap_PS_HC_antiIL17_KCsupCD103PosPSvsHCIntersectGenes.pdf"),
+    height = 6, 
+    width = 5)
+
+draw(hmap)
+
+invisible(dev.off())
+
+
+
+
+```
+
+```{r de_table}
+
+geneStatTable <- data.frame(gene = rownames(topGenesPSD0vsHC),
+                            psD0LesionalvsHC_LFC = topGenesPSD0vsHC$logFC,
+                            psD0LesionalvsHC_FDR = topGenesPSD0vsHC$adj.P.Val,
+                            
+                            psD4SecvsHC_LFC = topGenesPSD4vsHC$logFC[match(rownames(topGenesPSD0vsHC),
+                                                                          rownames(topGenesPSD4vsHC))],
+                            psD4SecvsHC_FDR = topGenesPSD4vsHC$adj.P.Val[match(rownames(topGenesPSD0vsHC),
+                                                                          rownames(topGenesPSD4vsHC))],
+                            
+                            psD14IxevsHC_LFC = topGenesPSD14IxevsHC$logFC[match(rownames(topGenesPSD0vsHC),
+                                                                          rownames(topGenesPSD14IxevsHC))],
+                            psD14IxevsHC_FDR = topGenesPSD14IxevsHC$adj.P.Val[match(rownames(topGenesPSD0vsHC),
+                                                                              rownames(topGenesPSD14IxevsHC))],
+                            
+                            psD14SecvsHC_LFC = topGenesPSD14vsHC$logFC[match(rownames(topGenesPSD0vsHC),
+                                                                          rownames(topGenesPSD14vsHC))],
+                            psD14SecvsHC_FDR = topGenesPSD14vsHC$adj.P.Val[match(rownames(topGenesPSD0vsHC),
+                                                                              rownames(topGenesPSD14vsHC))],
+                            
+                            psD42SecvsHC_LFC = topGenesPSD42vsHC$logFC[match(rownames(topGenesPSD0vsHC),
+                                                                          rownames(topGenesPSD42vsHC))],
+                            psD42SecvsHC_FDR = topGenesPSD42vsHC$adj.P.Val[match(rownames(topGenesPSD0vsHC),
+                                                                          rownames(topGenesPSD42vsHC))],
+                            
+                            psD84vsHC_LFC = topGenesPSD84vsHC$logFC[match(rownames(topGenesPSD0vsHC),
+                                                                          rownames(topGenesPSD84vsHC))],
+                            psD84vsHC_FDR = topGenesPSD84vsHC$adj.P.Val[match(rownames(topGenesPSD0vsHC),
+                                                                              rownames(topGenesPSD84vsHC))],
+                            
+                            PSD0NonLesionalvsHC_LFC = topGenesPSD0NonLesionalvsHC$logFC[match(rownames(topGenesPSD0vsHC),
+                                                                          rownames(topGenesPSD0NonLesionalvsHC))],
+                            PSD0NonLesionalvsHC_FDR = topGenesPSD0NonLesionalvsHC$adj.P.Val[match(rownames(topGenesPSD0vsHC),
+                                                                              rownames(topGenesPSD0NonLesionalvsHC))])
+
+write.csv(geneStatTable,
+          file.path(tablesDir, "externalPsoriasisDifferentialExpressionStatistics.csv"),
+          quote = F,
+          row.names = F)
+```
+
+```{r compare_gwas}
+
+#GRCh38.p14 and dbSNP Build 156
+
+gwas <- read_excel(file.path(dataDir,
+                             "gwas",
+                             "gwas-association-downloaded_2024-02-07-EFO_1000747-withChildTraits.xlsx"))
+
+excludeTraits <- c("Generalized pustular psoriasis",
+                   "COVID-19 or psoriasis (trans-disease meta-analysis)",
+                   "Paradoxical eczema in biologic-treated plaque psoriasis")
+
+gwas <- gwas %>%
+  dplyr::filter(!(`DISEASE/TRAIT` %in% excludeTraits))
+
+gwas$pNumber <- gwas$`P-VALUE` %>%
+  str_extract("^[0-9]+") %>%
+  as.numeric()
+gwas$pExp <- gwas$`P-VALUE` %>%
+  str_extract("[0-9]+$") %>%
+  as.numeric()
+
+gwas$pValue <- gwas$pNumber*10^(-1*gwas$pExp)
+
+gwas <- gwas %>%
+  dplyr::mutate(chrNum = str_extract(SNPS, "^chr[0-9,X,Y]+"),
+                chrNum = str_remove(chrNum, "chr"),
+                chrPos = str_extract(SNPS, ":[0-9]+|: [0-9]+"),
+                chrPos = str_extract(chrPos, "[0-9]+"),
+                chr = coalesce(CHR_ID,chrNum),
+                pos = coalesce(CHR_POS, chrPos),
+                pos = as.numeric(pos)) %>%
+  dplyr::filter(!is.na(pos))
+
+# gwasSimplified <- gwas %>%
+#   dplyr::group_by(SNPS) %>%
+#   dplyr::mutate(nStudies = n()) %>%
+#   dplyr::ungroup() %>%
+#     dplyr::group_by(SNPS, MAPPED_GENE) %>%
+#     dplyr::slice_min(pValue, n=1, with_ties = F) 
+
+
+```
+
+```{r annotate_genes_for_gwas_tcell_sigIntersect}
+
+geneStatTable <- data.frame(gene = rownames(topGenesPSD0vsHC),
+                            psD0vsHC_LFC = topGenesPSD0vsHC$logFC,
+                            psD0vsHC_FDR = topGenesPSD0vsHC$adj.P.Val,
+                            psD14vsHC_LFC = topGenesPSD14vsHC$logFC[match(rownames(topGenesPSD0vsHC),
+                                                                          rownames(topGenesPSD14vsHC))],
+                            psD14vsHC_FDR = topGenesPSD14vsHC$adj.P.Val[match(rownames(topGenesPSD0vsHC),
+                                                                              rownames(topGenesPSD14vsHC))],
+                            psD84vsHC_LFC = topGenesPSD84vsHC$logFC[match(rownames(topGenesPSD0vsHC),
+                                                                          rownames(topGenesPSD84vsHC))],
+                            psD84vsHC_FDR = topGenesPSD84vsHC$adj.P.Val[match(rownames(topGenesPSD0vsHC),
+                                                                              rownames(topGenesPSD84vsHC))],
+                            PSD0vsPSD84_LFC = topGenesPSD0vsPSD84$logFC[match(rownames(topGenesPSD0vsHC),
+                                                                          rownames(topGenesPSD0vsPSD84))],
+                            PSD0vsPSD84_FDR = topGenesPSD0vsPSD84$adj.P.Val[match(rownames(topGenesPSD0vsHC),
+                                                                              rownames(topGenesPSD0vsPSD84))])
+
+geneStatTable <- geneStatTable %>%
+  dplyr::mutate(Th1GeneSet = gene %in% supKCGeneSets$`Blood CD4+ Th1`$X1,
+                Th2GeneSet = gene %in% supKCGeneSets$`Blood CD4+ Th2`$X1,
+                Th17GeneSet = gene %in% supKCGeneSets$`Blood CD4+ Th17`$X1,
+                Th22GeneSet = gene %in% supKCGeneSets$`Blood CD4+ Th22`$X1,
+                CD103GeneSet = gene %in% supKCGeneSets$`Blood CD4+ CD103+`$X1)
+
+grch38 <- annotables::grch38
+
+geneStatTable <- geneStatTable %>%
+  dplyr::mutate(start = grch38$start[match(gene, grch38$symbol)],
+                end = grch38$end[match(gene, grch38$symbol)],
+                chr = grch38$chr[match(gene, grch38$symbol)])
+
+
+windowSize <- 500000
+
+#Use either side of the TSS to define the window
+
+geneStatTable <- geneStatTable %>%
+  dplyr::mutate(windowStart = start - windowSize,
+                windowEnd = start + windowSize)
+
+for(selGene in geneStatTable$gene) {
+  gwasOverlap <- gwas %>%
+    dplyr::filter(chr == geneStatTable$chr[match(selGene, geneStatTable$gene)]) %>%
+    dplyr::filter(pos >= geneStatTable$windowStart[match(selGene, geneStatTable$gene)]) %>%
+    dplyr::filter(pos <= geneStatTable$windowEnd[match(selGene, geneStatTable$gene)])
+  
+  if(nrow(gwasOverlap) > 0) {
+    geneStatTable$gwasOverlap[match(selGene, geneStatTable$gene)] <- TRUE
+    geneStatTable$gwasOverlapCount[match(selGene, geneStatTable$gene)] <- nrow(gwasOverlap)
+    geneStatTable$gwasMinP[match(selGene, geneStatTable$gene)] <- min(gwasOverlap$pValue)
+    geneStatTable$gwasMinSNP[match(selGene, geneStatTable$gene)] <- gwasOverlap$SNPS[which.min(gwasOverlap$pValue)]
+  } else {
+    geneStatTable$gwasOverlap[match(selGene, geneStatTable$gene)] <- FALSE
+    geneStatTable$gwasOverlapCount[match(selGene, geneStatTable$gene)] <- 0
+    geneStatTable$gwasMinP[match(selGene, geneStatTable$gene)] <- NA
+    geneStatTable$gwasMinSNP[match(selGene, geneStatTable$gene)] <- NA
+  }
+  
+}
+
+
+write.csv(geneStatTable,
+          file.path(tablesDir, "geneStatTable.csv"))
+
+```
+
+```{r plot_gwas_tcell_sigIntersect_th17}
+
+geneStatTable <- read.csv(file.path(tablesDir, "geneStatTable.csv"))
+
+th17Hits <- geneStatTable %>%
+  dplyr::filter(Th17GeneSet==TRUE) %>%  
+  dplyr::filter(psD0vsHC_FDR < 0.05,
+                abs(psD0vsHC_LFC) > 1) 
+
+th17gwasHits <- geneStatTable %>%
+  dplyr::filter(Th17GeneSet==TRUE) %>%  
+  dplyr::filter(psD0vsHC_FDR < 0.05,
+                abs(psD0vsHC_LFC) > 1) %>%
+  dplyr::filter(gwasOverlap==TRUE)
+
+th17TherapyResponsiveHits <- geneStatTable %>%
+  dplyr::filter(Th17GeneSet==TRUE) %>%
+  dplyr::filter(psD0vsHC_FDR < 0.05,
+                abs(psD0vsHC_LFC) > 1) %>%
+  dplyr::filter(PSD0vsPSD84_FDR < 0.05,
+                abs(PSD0vsPSD84_LFC) > 1)
+
+selGenes <- th17Hits$gene
+
+hmapAnno <- combAnno %>%
+  dplyr::mutate(sampleType = factor(sampleType,
+                                    levels = c("PS_D0",
+                                               "PS_D14_Placebo",
+                                               "PS_D4_Sec",
+                                               "PS_D14_Ixe",
+                                               "PS_D14_Sec",
+                                               "PS_D42_Sec",
+                                               "PS_D84_Sec",
+                                               "HC",
+                                               "PS_NonLesional"))) %>%
+  dplyr::arrange(sampleType)
+       
+
+hmapData <- batchCorExp[selGenes,hmapAnno$filename]
+
+columnAnno <- HeatmapAnnotation(Group = hmapAnno$sampleType,
+                                col = list(Group = sampleTypeColors))
+
+scaledData <- t(scale(t(hmapData))) 
+
+hmap <- Heatmap(scaledData,
+                name = "row z-score",
+                #cluster_columns = FALSE,
+                top_annotation = columnAnno,
+                row_names_gp = gpar(fontsize = 8),
+                show_column_names = FALSE,
+                show_row_names = TRUE)
+
+draw(hmap)
+
+pdf(file.path(plotsDir, "Heatmap_ExternalPS_Th17SigGenes.pdf"),
+    width = 8,
+    height = 6)
+
+draw(hmap)
+
+invisible(dev.off())
+
+```
+
+```{r th17_gwas_study_data}
+
+#Subset down gwas table to rows that are within the 1Mb window around the th17gwasHit genes
+
+th17GwasHits <- NULL
+
+for(selGene in th17gwasHits$gene){
+  
+  start <- th17gwasHits$start[th17gwasHits$gene == selGene]
+  selChr <- th17gwasHits$chr[th17gwasHits$gene == selGene]
+  
+  windowStart = start - windowSize
+  windowEnd = start + windowSize
+  
+  gwasMatches <- gwas %>%
+    dplyr::filter(chr == selChr,
+                  pos > windowStart,
+                  pos < windowEnd,
+                  !is.na(pos)) %>%
+    dplyr::mutate(th17GeneMatch = selGene,
+                  pos = as.numeric(pos),
+                  distToGeneMatch = pos-start)
+  
+  th17GwasHits <- bind_rows(th17GwasHits, gwasMatches)
+  
+}
+
+
+write.table(th17GwasHits,
+          file.path(tablesDir, "GWAS_SNPs_near_HCvsPS_DEGenes.csv"),
+          sep = "\t",
+          row.names = F)
+
+#RSAD2 looks wrong
+
+gwasTest <- gwas %>% dplyr::filter(SNPS %in% c("rs840967", "rs11675538"))
+```
+
+```{r plot_gwas_tcell_sigIntersect_th22}
+
+geneStatTable <- read.csv(file.path(tablesDir, "geneStatTable.csv"))
+
+th22gwasHits <- geneStatTable %>%
+  dplyr::filter(Th22GeneSet==TRUE) %>%  
+  dplyr::filter(psD0vsHC_FDR < 0.05,
+                abs(psD0vsHC_LFC) > 1) #%>%
+  #dplyr::filter(gwasOverlap==TRUE)
+
+selGenes <- th22gwasHits$gene
+
+hmapAnno <- combAnno %>%
+  dplyr::mutate(sampleType = factor(sampleType,
+                                    levels = c("PS_D0",
+                                               "PS_D14_Placebo",
+                                               "PS_D4_Sec",
+                                               "PS_D14_Ixe",
+                                               "PS_D14_Sec",
+                                               "PS_D42_Sec",
+                                               "PS_D84_Sec",
+                                               "HC",
+                                               "PS_NonLesional"))) %>%
+  dplyr::arrange(sampleType)
+       
+
+hmapData <- batchCorExp[selGenes,hmapAnno$filename]
+
+columnAnno <- HeatmapAnnotation(Group = hmapAnno$sampleType,
+                                col = list(Group = sampleTypeColors))
+
+scaledData <- t(scale(t(hmapData))) 
+
+hmap <- Heatmap(scaledData,
+                name = "row z-score",
+                #cluster_columns = FALSE,
+                top_annotation = columnAnno,
+                row_names_gp = gpar(fontsize = 8),
+                show_column_names = FALSE,
+                show_row_names = TRUE)
+
+draw(hmap)
+
+pdf(file.path(plotsDir, "Heatmap_ExternalPS_Th22SigGenes.pdf"),
+    width = 8,
+    height = 6)
+
+draw(hmap)
+
+invisible(dev.off())
+
+```
+
+```{r ind_gene_plots}
+
+plot_gene <- function(gene,
+                      counts_in,
+                      design_in,
+                      save_plot = TRUE,
+                      log_scale = TRUE){
+ 
+  #Make sure libs in design and counts are in the same order
+  if(sum(design_in$filename != colnames(counts_in))!= 0){
+    print("Check to make sure the order of libraries in counts and design match")
+    return(NULL)}
+  
+  #Add gene count into to design_in
+  
+  design_in$gene <- counts_in[rownames(counts_in) == gene,]
+  
+  design_in <- design_in %>%
+  dplyr::mutate(sampleType = factor(sampleType,
+                                    levels = c("PS_D0",
+                                               "PS_D14_Placebo",
+                                               "PS_D4_Sec",
+                                               "PS_D14_Ixe",
+                                               "PS_D14_Sec",
+                                               "PS_D42_Sec",
+                                               "PS_D84_Sec",
+                                               "PS_NonLesional",
+                                               "HC")))
+  
+  counts_in <- counts_in[,design_in$filename]
+  
+  if(log_scale == TRUE){
+    design_in$gene <- log2(design_in$gene +1)
+  }
+
+
+  g_gene_exp <- ggplot(design_in,
+           aes(x = sampleType,
+               y = gene,
+               #fill = stim,
+               color = sampleType))+
+      geom_boxplot(outlier.shape = NA)+
+      geom_quasirandom(dodge.width = 0.8)+
+      scale_color_manual(values = sampleTypeColors)+
+      #scale_y_continuous(limits = c(0, NA))+
+      labs(x = "",
+           y = paste0("Batch corrected expression"),
+           title = gene,
+           color = "")+
+      theme(axis.text.x = element_text(angle = 60, hjust = 1), 
+            text = element_text(size=12),
+            plot.title = element_text(hjust = 0.5)) +
+    guides(color="none")
+  
+   if(save_plot == TRUE){
+  filename <- file.path(plotsDir,
+                        paste(gene, "3PSDatasets.pdf", sep = "_"))
+  
+  pdf(filename,
+      height = 4,
+      width = 3,
+      useDingbats = F)
+  print(g_gene_exp)
+  invisible(dev.off())
+  
+  }
+  
+  #print(g_gene_exp)
+  
+  return(g_gene_exp)
+}
+
+#Get ind gene plots of the 24 Th17/ps overlap genes
+th17gwasHits <- geneStatTable %>%
+  dplyr::filter(Th17GeneSet==TRUE) %>%  
+  dplyr::filter(psD0vsHC_FDR < 0.05,
+                abs(psD0vsHC_LFC) > 1)
+
+
+lapply(th17gwasHits$gene, function(x){
+  plot_gene(x,
+            counts_in = batchCorExp,
+            design_in = combAnno,
+            save_plot = TRUE,
+            log_scale = FALSE)
+})
+
+
+```
+
+```{r ind_gene_stats}
+
+selGenes <- c("CCL20",
+              "CCL8",
+              "IL19")
+
+selGeneExpr <- cbind(combAnno, t(batchCorExp[selGenes,])) %>%
+  pivot_longer(cols = all_of(selGenes),
+               names_to = "gene",
+               values_to = "expression")
+
+psGeneStatsKW <- selGeneExpr %>%
+  dplyr::group_by(gene) %>%
+  rstatix::kruskal_test(expression ~ sampleType)
+
+psGeneStatsDunnPostHoc <- selGeneExpr %>%
+  dplyr::group_by(gene) %>%
+  rstatix::dunn_test(expression ~ sampleType, p.adjust.method = "bonferroni")
+
+write.csv(psGeneStatsKW, file.path(tablesDir, "PSSelectedGeneStatsKruskalWallisTest.csv"), quote=FALSE, row.names = FALSE)
+write.csv(psGeneStatsDunnPostHoc, file.path(tablesDir, "PSSelectedGeneStatsDunnPostHocComparisons.csv"), quote=FALSE, row.names = FALSE)
+
+
+#Add stats comparing everything to HC
+
+psGeneStatsHC <- selGeneExpr %>%
+  dplyr::group_by(gene) %>%
+  rstatix::wilcox_test(expression ~ sampleType,
+                       ref.group = "HC",
+                       p.adjust.method = "bonferroni")
+
+write.csv(psGeneStatsHC, file.path(tablesDir, "PSSelectedGeneStatsRelativeToHCWilcoxTest.csv"), quote=FALSE, row.names = FALSE)
+
+#Add stats comparing everything to Non lesional
+
+psGeneStatsNL <- selGeneExpr %>%
+  dplyr::group_by(gene) %>%
+  rstatix::wilcox_test(expression ~ sampleType,
+                       ref.group = "PS_NonLesional",
+                       p.adjust.method = "bonferroni")
+
+write.csv(psGeneStatsNL, file.path(tablesDir, "PSSelectedGeneStatsRelativeToNonLesionalWilcoxTest.csv"), quote=FALSE, row.names = FALSE)
+
+psGeneStatsD0 <- selGeneExpr %>%
+  dplyr::group_by(gene) %>%
+  rstatix::wilcox_test(expression ~ sampleType,
+                       ref.group = "PS_D0",
+                       p.adjust.method = "bonferroni")
+
+write.csv(psGeneStatsD0, file.path(tablesDir, "PSSelectedGeneStatsRelativeToDay0LesionalWilcoxTest.csv"), quote=FALSE, row.names = FALSE)
+
+```
+
+```{r individual_gene_stats_for_all24genes}
+
+selGenes <- th17Hits$gene
+
+selGeneExpr <- cbind(combAnno, t(batchCorExp[selGenes,])) %>%
+  pivot_longer(cols = all_of(selGenes),
+               names_to = "gene",
+               values_to = "expression")
+
+psGeneStatsKW <- selGeneExpr %>%
+  dplyr::group_by(gene) %>%
+  rstatix::kruskal_test(expression ~ sampleType)
+
+psGeneStatsDunnPostHoc <- selGeneExpr %>%
+  dplyr::group_by(gene) %>%
+  rstatix::dunn_test(expression ~ sampleType, p.adjust.method = "bonferroni")
+
+write.csv(psGeneStatsKW, file.path(tablesDir, "PS_FigureS6_24Genes_KruskalWallisTest.csv"), quote=FALSE, row.names = FALSE)
+write.csv(psGeneStatsDunnPostHoc, file.path(tablesDir, "PS_FigureS6_24Genes_DunnPostHocComparisons.csv"), quote=FALSE, row.names = FALSE)
+
+#Add stats comparing everything to day 0 Ps
+
+psGeneStatsD0 <- selGeneExpr %>%
+  dplyr::group_by(gene) %>%
+  rstatix::wilcox_test(expression ~ sampleType,
+                       ref.group = "PS_D0",
+                       p.adjust.method = "bonferroni")
+
+write.csv(psGeneStatsD0, file.path(tablesDir, "PS_FigureS6_24Genes_RelativeToDay0LesionalWilcoxTest.csv"), quote=FALSE, row.names = FALSE)
+
+
+```
+
+# Enrichment dot plots
+
+```{r enrichr, eval=FALSE}
+
+#enrichR uses hypergeometric tests for p-values (according to their website)
+#To parallel this, hypergeomtric p-values 
+
+library(enrichR)
+setEnrichrSite("Enrichr") # Human genes
+
+dbs <- listEnrichrDbs()
+#Category 2 are pathways databases
+
+dbs <- dbs %>%
+  dplyr::filter(categoryId == 2)
+
+#Add database name to each list item before turning into a df
+
+getEnrichment <- function(geneList,
+                          dbsInput){
+  
+  enriched <-  enrichr(geneList, dbsInput)
+  
+  enriched <- enriched[sapply(enriched, nrow)>0]
+  enriched <- bind_rows(enriched, .id = "database")
+  #Hack to get plot function to show FDR
+  enriched$origPValue <- enriched$P.value
+  enriched$P.value <- p.adjust(enriched$P.value, 
+                           method = "fdr")
+  
+  enriched$Old.P.value <- NULL
+  enriched$Old.Adjusted.P.value <- NULL
+  
+  enriched$nGenes <- str_extract(enriched$Overlap, "[0-9]+") %>% 
+    as.numeric()
+  enriched$nSet <- str_extract(enriched$Overlap, "[0-9]+$") %>% 
+    as.numeric()
+  enriched$frac <- enriched$nGenes/enriched$nSet
+  
+  enriched <- enriched %>%
+    dplyr::arrange(origPValue)
+  
+  
+  return(enriched)
+}
+
+
+databases <- dbs$libraryName
+
+topTablesFib <- list("Blood CD4+ Th1" = topGenesBloodCD4Th1VAllCD4sFib,
+                    "Blood CD4+ Th2" = topGenesBloodCD4Th2VAllCD4sFib,
+                    "Blood CD4+ Th17" = topGenesBloodCD4Th17VAllCD4sFib,
+                    "Blood CD4+ Th22" = topGenesBloodCD4Th22VAllCD4sFib,
+                    "Blood CD4+ CD103+" = topGenesBloodCD4CD103posVAllCD4sFib,
+                    "Skin CD4+ CD103-" = topGenesSkinCD4CD103negVAllCD4sFib,
+                    "Skin CD4+ CD103+" = topGenesSkinCD4CD103posVAllCD4sFib)
+
+get_sig_genes_up <- function(top_genes,
+                          lfc_cutoff = 1,
+                          fdr_cutoff = 0.05){
+  
+  top_genes$gene <- rownames(top_genes)
+  
+  sig_table <- top_genes %>%
+    dplyr::filter(logFC > lfc_cutoff,
+                  adj.P.Val < fdr_cutoff)
+  
+  sig_genes <- sig_table$gene
+  return(sig_genes)
+
+}
+
+fibDEGeneList <- lapply(topTablesFib, get_sig_genes_up)
+
+selectedDatabases <- c("GO_Biological_Process_2023",
+               "MSigDB_Hallmark_2020",
+               "KEGG_2021_Human",
+               "Reactome_2022")
+
+selectedDatabases <- c("Reactome_2022")
+
+enrichedSupFibVAllCD4s <- lapply(fibDEGeneList,
+                                 function(x) getEnrichment(x, selectedDatabases))
+
+
+flattenList <- function(listIn){
+  
+  for(i in 1:length(listIn)){
+    listIn[[i]]$comparison <- names(listIn)[[i]]
+  }
+  
+  flattened <- as.data.frame(do.call(rbind, listIn))
+  
+  flattened <- flattened %>%
+    dplyr::filter(database %in% selectedDatabases)
+  
+  return(flattened)
+  
+}
+
+enrichedSupFibVAllCD4s <- flattenList(enrichedSupFibVAllCD4s)
+
+
+library(ggtree)
+library(ggdendro)
+library(rvcheck)
+enrichedDotPlot <- function(enrichedDF,
+                            plotName,
+                            fracCutoff = 0.10,
+                            pCutoff = 1e-6,
+                            nTerms = 10,
+                            figureHeight = 6,
+                            figureWidth = 8){
+  
+  #Remove numbers from term names
+  enrichedDF <- enrichedDF %>%
+    dplyr::mutate(Term = str_remove(Term, " R\\-HSA\\-[0-9]+")) 
+  
+  #Subset to pathways that are > fracCutoff or pCutoff for at least one set of conditions and take at most the top 10 terms from a condition
+enrichedPathways <- enrichedDF  %>% 
+  dplyr::filter(frac > fracCutoff ) %>%
+   dplyr::filter(`P.value` < pCutoff) %>%
+  dplyr::group_by(comparison) %>%
+  dplyr::slice_min(`P.value`, n = nTerms)
+
+
+mat <- enrichedDF %>% 
+  select(frac, comparison, Term) %>%  # drop unused columns to facilitate widening
+  dplyr::filter(Term %in% enrichedPathways$Term) %>% 
+  pivot_wider(id_cols = Term,
+              names_from = comparison, 
+              values_from = frac,
+              values_fill = 0) %>% 
+  data.frame() # make df as tibbles -> matrix annoying
+row.names(mat) <- mat$Term  # put gene in `row`
+mat <- mat[,-1] #drop gene column as now in rows
+clust <- hclust(dist(mat %>% as.matrix()))
+
+mat2 <- enrichedDF %>% 
+  select(frac, comparison, Term) %>%  # drop unused columns to facilitate widening
+  dplyr::filter(Term %in% enrichedPathways$Term) %>% 
+  pivot_wider(id_cols = comparison,
+              names_from = Term, 
+              values_from = frac,
+              values_fill = 0) %>% 
+  data.frame() # make df as tibbles -> matrix annoying
+row.names(mat2) <- mat2$comparison  # put gene in `row`
+mat2 <- mat2[,-1] #drop gene column as now in rows
+clust2 <- hclust(dist(mat2 %>% as.matrix()))
+
+ddgram <- as.dendrogram(clust) # create dendrogram
+ggtree_plot <- ggtree::ggtree(ddgram)
+ggtree_plot
+
+
+gEnrichedDot <- enrichedDF  %>% 
+  dplyr::filter(Term %in% enrichedPathways$Term) %>% 
+  dplyr::mutate(Term = factor(Term, levels = clust$labels[clust$order])) %>%
+    #dplyr::mutate(comparison = factor(comparison, levels = clust2$labels[clust2$order])) %>%
+  ggplot(aes(x=comparison, y = Term, color = -log10(`P.value`), size = frac)) + 
+  geom_point() +
+    scale_color_gradientn(colours = viridis::viridis(20)) +
+  scale_y_discrete(position = "right") +
+  labs(x = "",
+       y = "",
+       color = "-log10 adj P",
+       size = "proportion of pathway genes") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1),
+        text = element_text(size=12)) 
+
+cowplot::plot_grid(ggtree_plot, gEnrichedDot, nrow = 1, rel_widths = c(0.5,2), align = 'h')
+
+
+pdf(file.path(plots_dir, plotName),
+    height = figureHeight,
+    width = figureWidth)
+print(cowplot::plot_grid(ggtree_plot, gEnrichedDot, nrow = 1, rel_widths = c(0.25,2), align = 'h'))
+
+invisible(dev.off())
+
+return(gEnrichedDot)
+}
+
+enrichedDotPlot(enrichedSupFibVAllCD4s,
+                "DotPlotEnrichment_SupFib.pdf",
+                figureHeight = 6,
+                figureWidth = 12)
+
+
+
+```
+
+
+
+```{r dot_plots}
+
+#Make a TERM2NAME data frame
+geneSets <- data.table::rbindlist(supKCGeneSets[c("Blood CD4+ Th1",
+                        "Blood CD4+ Th2",
+                        "Blood CD4+ Th17",
+                        "Blood CD4+ Th22",
+                        "Blood CD4+ CD103+")], 
+                        idcol = "name")
+names(geneSets) <- c("name", "geneID")
+
+getGSEAStats <- function(topGenesIn,
+                         geneSetsIn,
+                         compIn = NULL){
+  
+  topGenesSorted <- topGenesIn %>%
+    dplyr::arrange(desc(logFC)) 
+  
+  gseaGeneList <- topGenesSorted$logFC
+  names(gseaGeneList) <- rownames(topGenesSorted)
+  
+  gsea <- GSEA(gseaGeneList, 
+               TERM2GENE = geneSetsIn,
+               minGSSize = 5,
+               pvalueCutoff = 1)
+
+  gsea <- gsea@result
+  
+  gsea$comparison <- compIn
+  
+  gsea$coreEnrichCount <- str_count(gsea$core_enrichment, "\\/")+1
+  
+  gsea$frac <- gsea$coreEnrichCount/gsea$setSize
+  
+  return(gsea)
+}
+
+gseaPSD0vsPSD84 <- getGSEAStats(topGenesPSD0vsPSD84,
+                     geneSets, 
+                     "PSD0vsPSD84")
+
+gseaPSD0vsHC <- getGSEAStats(topGenesPSD0vsHC,
+                     geneSets,
+                     "PSD0vsHC")
+
+gseaPSD84vsHC <- getGSEAStats(topGenesPSD84vsHC,
+                     geneSets,
+                     "PSD84vsHC")
+
+gseaStats <- bind_rows(gseaPSD0vsPSD84,
+                      gseaPSD0vsHC,
+                      gseaPSD84vsHC)
+
+
+gseaDot <- gseaStats  %>% 
+  dplyr::mutate(Description = factor(Description,
+                                     levels = rev(c("Blood CD4+ CD103+",
+                                                "Blood CD4+ Th1",
+                        "Blood CD4+ Th2",
+                        "Blood CD4+ Th17",
+                        "Blood CD4+ Th22")))) %>% 
+  ggplot(aes(x=comparison, y = Description, color = -log10(`p.adjust`), size = frac)) + 
+  geom_point() +
+    scale_color_gradientn(colours = viridis::viridis(20)) +
+  scale_y_discrete(position = "right") +
+  labs(x = "",
+       y = "",
+       color = "-log10 adj P",
+       size = "proportion of signature genes\nin GSEA core enrichment") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1),
+        text = element_text(size=12)) 
+
+pdf(file.path(plotsDir, "Dotplot_GSEA_KCSupSigsInPsGroups.pdf"),
+    height = 5,
+    width = 6)
+
+print(gseaDot)
+
+invisible(dev.off())
+
+
+```
+
+```{r dot_plot_v2}
+
+stimSortColors <- c("#000000", "#FF3333", "#993333", "#FFCC66", 
+                    "#66CCFF", "#009966", "#CC99CC", "#666666") 
+
+names(stimSortColors) <- c("Unstimulated",
+                           "Blood CD4+ CD103+",
+                           "Blood CD4+ Th1",
+                           "Blood CD4+ Th17",
+                           "Blood CD4+ Th2",
+                           "Blood CD4+ Th22",
+                           "Skin CD4+ CD103-",
+                           "Skin CD4+ CD103+")
+stimSortShapes <- c("Unstimulated" = 17,
+                    "Blood CD4+ CD103+" = 15,
+                    "Blood CD4+ Th1" = 15,
+                    "Blood CD4+ Th17" = 15,
+                    "Blood CD4+ Th2" = 15,
+                    "Blood CD4+ Th22" = 15,
+                    "Skin CD4+ CD103-" = 1,
+                    "Skin CD4+ CD103+" = 1)
+
+
+gGSEAPlot <- gseaStats  %>% 
+  dplyr::mutate(Description = factor(Description,
+                                     levels = rev(c("Blood CD4+ CD103+",
+                                                "Blood CD4+ Th1",
+                        "Blood CD4+ Th2",
+                        "Blood CD4+ Th17",
+                        "Blood CD4+ Th22"))))  %>%
+   ggplot(aes(x = -log10(`p.adjust`), 
+              y = comparison, 
+              color = Description, 
+              shape = Description)) +
+   geom_point(size = 3) +
+  #geom_point(position = position_jitterdodge(jitter.width = 0, dodge.width = 0.25),
+  #           size = 3) +
+   scale_color_manual(values = stimSortColors)+
+   scale_shape_manual(values = stimSortShapes) +
+   labs(x = "-log10 adj P",
+        y = "",
+        color = "",
+        shape = "") +
+   theme(text = element_text(size=12),
+         panel.grid.major.y = element_line()) +
+   guides(color = "none",
+          shape = "none") 
+
+
+pdf(file.path(plotsDir, "enrichmentPValuePlotInPsoriasis.pdf"),
+    height = 4,
+    width = 4)
+print(gGSEAPlot)
+invisible(dev.off())
+
+
+```
+
+```{r gsea_radar_plot}
+
+library(fmsb)
+
+gseaForRadar <- gseaStats %>%
+  dplyr::mutate(log10p = -log10(`p.adjust`)) %>%
+  dplyr::select(Description, comparison, log10p) %>%
+  tidyr::spread(key = Description, value = log10p) %>%
+  as.data.frame() 
+  
+rownames(gseaForRadar) <- gseaForRadar$comparison
+gseaForRadar$comparison <- NULL
+
+gseaForRadar <- rbind("max" = rep(ceiling(max(gseaForRadar)),ncol(gseaForRadar)),
+                      "min" = c(0,0,0,0),
+                      gseaForRadar) 
+
+
+compColors <- c("#00AFBB", "#E7B800", "#FC4E07")
+
+pdf(file.path(plotsDir, "radarPValuePlotInPsoriasis.pdf"),
+    height = 6,
+    width = 6)
+
+op <- par(mar = c(1, 2, 2, 2))
+
+radarchart(gseaForRadar,
+           pcol = compColors, 
+           pfcol = scales::alpha(compColors, 0.2),
+           axistype = 1,
+           caxislabels = c(2, 4, 6, 8, 10),
+           axislabcol = "grey", 
+           plwd = 2, 
+           plty = 1)
+
+legend(
+  x = "topright", legend = rownames(gseaForRadar[-c(1,2),]), horiz = FALSE,
+  bty = "n", pch = 20 , col = compColors,
+  text.col = "black", cex = 1, pt.cex = 1.5
+  )
+
+par(op)
+
+invisible(dev.off())
+
+
+```
+
+```{r barcode_plots}
+
+  topGenesSorted <- topGenesPSD0vsPSD84 %>%
+    dplyr::arrange(desc(logFC)) 
+  
+  gseaGeneList <- topGenesSorted$logFC
+  names(gseaGeneList) <- rownames(topGenesSorted)
+  
+  gsea <- GSEA(gseaGeneList, 
+               TERM2GENE = geneSets,
+               pvalueCutoff = 1)
+  
+  dotplot(gsea)
+
+supGeneSetColors <- rcartocolor::carto_pal(5, "Vivid")
+names(supGeneSetColors) <- sort(unique(geneSets$name))
+
+gBarcode <- gseaplot2(gsea, 
+          geneSetID = 1:4, 
+          pvalue_table = TRUE,
+          color = supGeneSetColors,
+          subplots = 1:2)
+
+pdf(file.path(plotsDir, "BarcodePlot_supKCGeneSets_PSMicroarray_PSvsAntiIL17.pdf"),
+    height = 5,
+    width = 8)
+
+print(gBarcode)
+
+invisible(dev.off())
+
+#dotplot(gsea)
+options(ggrepel.max.overlaps = Inf)
+
+
+gCnetplot <- cnetplot(gsea, 
+                      foldChange=gseaGeneList,
+                      showCategory=4,
+                      max.overlaps=Inf) +
+  scale_color_viridis(name = "Log2 fold change, PS:PS+aIL17",
+                      limits = c(0,5))
+
+
+pdf(file.path(plotsDir, "CnetplotPlot_supKCGeneSets_PSMicroarray_PSvsAntiIL17.pdf"),
+    height = 6,
+    width = 10)
+
+print(gCnetplot)
+
+invisible(dev.off())
+#heatplot(gsea, foldChange = gseaGeneList, showCategory=5)
+#upsetplot(gsea)
+#ridgeplot(gsea)
+```
+
+```{r lfc_plot}
+
+# Plot LFC in PS vs HC against LFC in PS vs anti IL17
+# Color genes by membership in KC Sup stimulated tests
+
+combinedTopGenes <- data.frame("gene" = rownames(topGenesPSD0vsHC),
+                               "PSD0vsHC_LFC" = topGenesPSD0vsHC$logFC,
+                               "PSD0vsHC_FDR" = topGenesPSD0vsHC$adj.P.Val,
+                               "PSD0vsPSD84_LFC" = topGenesPSD0vsPSD84$logFC[match(rownames(topGenesPSD0vsHC),
+                                                                          rownames(topGenesPSD0vsPSD84))],
+                               "PSD0vsPSD84_FDR" = topGenesPSD0vsPSD84$adj.P.Val[match(rownames(topGenesPSD0vsHC),
+                                                                              rownames(topGenesPSD0vsPSD84))])
+
+combinedTopGenes$Th1GeneSet <- combinedTopGenes$gene %in% supKCGeneSets$`Blood CD4+ Th1`$X1
+combinedTopGenes$Th2GeneSet <- combinedTopGenes$gene %in% supKCGeneSets$`Blood CD4+ Th2`$X1
+combinedTopGenes$Th17GeneSet <- combinedTopGenes$gene %in% supKCGeneSets$`Blood CD4+ Th17`$X1
+combinedTopGenes$Th22GeneSet <- combinedTopGenes$gene %in% supKCGeneSets$`Blood CD4+ Th22`$X1
+combinedTopGenes$CD103GeneSet <- combinedTopGenes$gene %in% supKCGeneSets$`Blood CD4+ CD103+`$X1
+
+#Make a column that reports the names of the gene sets that the gene is in
+
+combinedTopGenes$geneSetMembership <- NA
+
+for(i in 1:nrow(combinedTopGenes)){
+  combinedTopGenes$geneSetMembership[i] <- paste(names(combinedTopGenes[i,6:10])[combinedTopGenes[i,6:10] == TRUE],
+                                                 collapse = ",")
+}
+
+combinedTopGenes$geneSetMembershipNumber <- rowSums(combinedTopGenes[,6:10])
+
+combinedTopGenes <- combinedTopGenes %>%
+  dplyr::mutate(geneSetMembershipSimplified = case_when(combinedTopGenes$geneSetMembership == "Th1GeneSet,Th17GeneSet" ~ "Multiple: Blood CD4+ Th1 and Th17",
+                                                        combinedTopGenes$geneSetMembership == "Th17GeneSet,Th22GeneSet" ~ "Multiple: Blood CD4+ Th17 and Th22",
+                                                        combinedTopGenes$geneSetMembershipNumber >=2 ~ "Multiple: Other",
+                                                        Th1GeneSet == TRUE ~ "Blood CD4+ Th1",
+                                                        Th2GeneSet == TRUE ~ "Blood CD4+ Th2",
+                                                        Th17GeneSet == TRUE ~ "Blood CD4+ Th17",
+                                                        Th22GeneSet == TRUE ~ "Blood CD4+ Th22",
+                                                        CD103GeneSet == TRUE ~ "Blood CD4+ CD103+",
+                                                        TRUE ~ "None"),
+                geneSetMembershipSimplified = factor(geneSetMembershipSimplified,
+                                                     levels = c("Blood CD4+ CD103+",
+                                                                "Blood CD4+ Th1",
+                                                                "Blood CD4+ Th2",
+                                                                "Blood CD4+ Th17",
+                                                                "Blood CD4+ Th22",
+                                                                "Multiple: Blood CD4+ Th1 and Th17",
+                                                                "Multiple: Blood CD4+ Th17 and Th22",
+                                                                "Multiple: Other",
+                                                                "None")))
+
+#Add gene labels for genes that are in the Th17 gene set and have a LFC > 1 in PS vs HC or PS vs anti IL17
+combinedTopGenes$geneLabel <- ifelse(combinedTopGenes$geneSetMembershipSimplified != "None" &
+                                          (combinedTopGenes$PSD0vsPSD84_LFC > 2 | combinedTopGenes$PSD0vsHC_LFC > 2), combinedTopGenes$gene, NA)
+
+#Include genes in panel E
+combinedTopGenes$geneLabel[combinedTopGenes$gene == "CCL8"] <- TRUE
+combinedTopGenes$geneLabel[combinedTopGenes$gene == "CCL20"] <- TRUE
+combinedTopGenes$geneLabel[combinedTopGenes$gene == "IL19"] <- TRUE
+
+
+geneSetMembershipColors <- c("Blood CD4+ CD103+"= "#FF3333", 
+                    "Blood CD4+ Th1" = "#993333", 
+                    "Blood CD4+ Th17" = "#FFCC66", 
+                    "Blood CD4+ Th2" = "#66CCFF", 
+                    "Blood CD4+ Th22" = "#009966", 
+                    "Multiple: Blood CD4+ Th1 and Th17" = "#993333",
+                    "Multiple: Blood CD4+ Th17 and Th22" = "#009966",
+                    "Multiple: Other" =  "#000000", 
+                    "None" = "#D3D3D3") 
+
+geneSetMembershipBorderColors <- c("Blood CD4+ CD103+"= "#FF3333", 
+                    "Blood CD4+ Th1" = "#993333", 
+                    "Blood CD4+ Th17" = "#FFCC66", 
+                    "Blood CD4+ Th2" = "#66CCFF", 
+                    "Blood CD4+ Th22" = "#009966", 
+                    "Multiple: Blood CD4+ Th1 and Th17" = "#FFCC66",  
+                    "Multiple: Blood CD4+ Th17 and Th22" = "#FFCC66", 
+                    "Multiple: Other" =  "#000000", 
+                    "None" = "#D3D3D3")    
+
+gScatter <- ggplot() +
+  # geom_point(data = combinedTopGenes[combinedTopGenes$geneSetMembershipSimplified == "None",], 
+  #            aes(x = PSD0vsHC_LFC,
+  #            y = PSD0vsPSD84_LFC,
+  #            color = geneSetMembershipSimplified,
+  #            fill = geneSetMembershipSimplified),
+  #            shape = 21) +
+    geom_abline(slope = 1,
+              intercept = 0,
+              color = "gray") +
+  geom_point(data = combinedTopGenes[combinedTopGenes$geneSetMembershipSimplified != "None",], 
+             aes(x = PSD0vsHC_LFC,
+             y = PSD0vsPSD84_LFC,
+             color = geneSetMembershipSimplified,
+             fill = geneSetMembershipSimplified),
+             shape = 21) +
+  geom_text_repel(data = combinedTopGenes[!is.na(combinedTopGenes$geneLabel),], 
+            aes(x = PSD0vsHC_LFC,
+             y = PSD0vsPSD84_LFC,
+             label = gene),
+            max.overlaps = Inf) +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  scale_color_manual(values = geneSetMembershipColors) +
+  scale_fill_manual(values = geneSetMembershipBorderColors) +
+  labs(x = "Log2 fold change, PS vs HC",
+       y = "Log2 fold change, PS vs anti IL17",
+       color = "Signature",
+       fill = "Signature") +
+  theme(aspect.ratio = 1)
+
+pdf(file.path(plotsDir, "Scatterplot_LFCPsVsHC_LFCPsVsAntiIL17Day84.pdf"),
+    height = 6,
+    width = 10)
+
+print(gScatter)
+invisible(dev.off())
+
+```

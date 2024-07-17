@@ -1,0 +1,2471 @@
+---
+title: "P253-2 RNA-seq of cultured keratinocytes and fibroblasts, CD4s only"
+author: "Analyst: Hannah DeBerg, Experimenter: Peter Morawski"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    number_sections: true
+editor_options: 
+  chunk_output_type: console
+---
+
+To investigate the response of keratinocytes and fibroblasts to T-cell signalling, samples were cultured in a variety of T-cell supernatants. T-cells from donors were sorted from blood and skin and cultured in media containing anti-CD3, anti-CD28, and anti-CD2 for 48 hours. T-cell supernatant was then used to stimulate the fibroblasts or keratinocytes for 24 hours. A conditioned media that contained anti-CD3, anti-CD28, and anti-CD2 but no T cells and was "cultured" for 48 hours alongside the T-cell samples was also used as a control.
+
+The following T-cell sort conditions explored in this experiment are listed below.
+
+-   Control (media only)
+-   Blood CD4+CLA+CD103+ T-cell supernatant
+-   Blood CD4+CLA+Th1 T-cell supernatant
+-   Blood CD4+CLA+Th1/17 T-cell supernatant
+-   Blood CD4+CLA+Th17 T-cell supernatant
+-   Blood CD4+CLA+Th2 T-cell supernatant
+-   Blood CD4+CLA+Th22 T-cell supernatant
+-   Skin CD4+CLA+CD103- T-cell supernatant
+-   Skin CD4+CLA+CD103+ T-cell supernatant
+
+
+```{r setup, echo=FALSE, message=FALSE, warning=FALSE}
+library(knitr)
+library(dplyr)
+library(ggplot2); theme_set(
+  theme_bw(20) +
+    theme(panel.grid.major = element_blank(),
+          panel.grid.minor = element_blank(),
+          panel.border = element_rect(colour="black", fill=NA, size=1),
+          axis.text=element_text(colour="black"),
+          axis.ticks=element_line(colour="black"),
+          legend.key = element_blank(),
+          text = element_text(size=20),
+          strip.text.x = element_text(size = 10,margin = margin( b = 2, t = 2) ),
+            strip.background = element_rect(fill="white", colour="black")))
+
+library(ggthemes)
+library(ggbeeswarm)
+library(viridis)
+library(stringr)
+library(readxl)
+library(kableExtra)
+library(RColorBrewer)
+library(plotly)
+library(tidyr)
+library(gtools)
+library(apird) #API for the research database
+#library(devtools)  #if needed to obtain github packages
+# install_github('mjdufort/TCRtools') #if needed to get Matt Dufort's package
+library(annotables)
+#devtools::install_github("stephenturner/annotables")
+library(data.table)
+library(edgeR)
+library(ggrepel)
+library(ComplexHeatmap)
+library(geneSetTools) # For barcode plots
+#devtools::install_github("mjdufort/countSubsetNorm")
+#devtools::install_github("mjdufort/geneSetTools")
+library(egg) #For ggarrange
+library(ggpubr) #Also for ggarrange
+library(umap)
+library(AnnotationDbi)
+library(org.Hs.eg.db)
+library(forcats)
+library(randomcoloR)
+library(circlize)
+library(ggbreak)
+library(ggtree)
+library(ggdendro)
+library(rvcheck)
+
+opts_chunk$set(fig.width=6, fig.height=4.0, cache = TRUE, echo=FALSE, warning=FALSE, message=FALSE, results='hide')
+opts_knit$set(root.dir = "/Users/hdeberg/Box/P253_PeterM_Campbell_Keratinocytes_Fibroblasts")
+
+options(stringsAsFactors = FALSE)
+```
+
+```{r set_up_directories, cache = TRUE}
+
+base_dir <- "/Users/hdeberg/Box/P253_PeterM_Campbell_Keratinocytes_Fibroblasts"
+data_dir <- file.path(base_dir, "data")
+plots_dir <- file.path(base_dir, "plots")
+tables_dir <- file.path(base_dir, "tables")
+
+```
+
+# Read and process data
+
+```{r get_data}
+##Use apird function to get project data
+# project <- "P253-2"
+# 
+# getGcqProjectInfo(project)
+# libids <- getProjectLibs(project, searchType = "regex")
+# 
+# anno <- getAnno(libids)
+# metrics <- getMetrics(libids)
+# counts <- getGeneCounts(libids)
+# # 
+# # #Save for offline analysis
+# save(anno,
+#      metrics,
+#      counts,
+#      file = file.path(data_dir,"P253_2Data_Corrected.Rdata"))
+
+load(file.path(data_dir,
+               "P253_2Data_Corrected.Rdata"))
+
+```
+
+```{r clean_data}
+
+metrics$libid <- str_extract(metrics$libid_fcid, "lib[0-9]+")
+
+design <- full_join(anno, metrics, by = c("libid"))
+counts <- t(counts) 
+
+colnames(counts) <- str_extract(colnames(counts), "lib[0-9]+")
+
+#Make sure the order of libs in counts and design match. 
+counts <- counts[,design$libid]
+
+design$sampleRow <- str_extract(design$sampleWell, "[A-H]")
+
+design$sampleColumn <- design$sampleWell %>% 
+  str_extract("[0-9]+") %>%
+  str_remove("^0") %>%
+  as.numeric()
+
+
+design$stim <- case_when(design$stimulation == "Blood T cell supernatant" ~ "Blood",
+                         design$stimulation == "Skin T cell supernatant" ~ "Skin",
+                         design$stimulation == "Conditioned Media" ~ "Unstimulated",
+                         TRUE ~ "Other")
+
+design$sort <- str_replace(design$sort, "neg", "-")
+
+design$stimSort <- paste0(design$stim, design$sort)
+
+#replace + and - to get a stimSort with non-punct chars only for limma modeling
+design$stimSortChar <- design$stimSort %>%
+  str_replace_all("\\+", "pos") %>%
+  str_replace_all("\\-", "neg") %>%
+  str_replace_all("\\/", "_") #Replace / in Th1/Th17
+
+#Set factor reference levels
+
+design$sort <- design$sort %>%
+  as.factor() %>%
+  fct_relevel("Control")
+
+design$subjectID <- design$subjectID %>%
+  as.factor() %>%
+  fct_relevel("Control")
+
+design$stim <- design$stim %>%
+  as.factor() %>%
+  fct_relevel("Unstimulated")
+
+design$stimSort <- design$stimSort %>%
+  as.factor() %>%
+  fct_relevel("UnstimulatedControl")
+
+design$stimSortChar <- design$stimSortChar %>%
+  as.factor() %>%
+  fct_relevel("UnstimulatedControl")
+
+#Clean cytokine columns
+
+cleanCytokineValues <- function(cytokineVar){
+  #Deal with values below the detection limit
+  cytokineVar <- str_remove_all(cytokineVar, "[<,>]")
+  cytokineVar <- as.numeric(cytokineVar)
+  
+  return(cytokineVar)
+  
+}
+
+cytokineCols <- c("IL5",
+                   "IL13",
+                   "IL2",
+                   "IL6",
+                   "IL9",
+                   "GMCSF",
+                   "IFNGamma",
+                   "TNFAlpha",
+                   "IL17a",
+                   "IL17f",
+                   "IL4",
+                   "IL10",
+                   "IL22")
+
+design <- design %>%
+  dplyr::mutate(across(cytokineCols, cleanCytokineValues))
+
+#Subset to CD4 stimulated samples
+design <- design %>%
+  dplyr::filter(!stimSort %in% c("SkinCD8+CLA+CD103+",
+                                 "SkinCD8+CLA+CD103-"))
+#Filter Th1/17s
+design <- design %>%
+  dplyr::filter(!stimSort %in% c("BloodCD4+CLA+Th1/17"))
+
+design <- droplevels(design)
+
+counts <- counts[,design$libid]
+
+```
+
+```{r set_colors}
+
+cellTypeColors <- c("Fibroblasts" = "darkred",
+                      "Keratinocytes" = "cadetblue")
+
+stimColors <- rcartocolor::carto_pal(3,"Vivid") %>%
+  as.vector()
+names(stimColors) <- levels(design$stim)
+
+stimShapes <- c("Unstimulated" = 17,
+                "Blood" = 15,
+                "Skin" = 1)
+
+
+sortColors <- rcartocolor::carto_pal(7, "Vivid") %>%
+  as.vector()
+names(sortColors) <- levels(design$sort)
+
+stimSortColors <- c("#000000", "#FF3333", "#993333", "#FFCC66", 
+                    "#66CCFF", "#009966", "#CC99CC", "#666666") 
+
+names(stimSortColors) <- levels(design$stimSort)
+
+stimSortCharColors <- stimSortColors
+names(stimSortCharColors) <- levels(design$stimSortChar)
+
+set.seed(50)
+subjectColors <- c("#000000", 
+                    "#cccc66",
+                   "#777777", 
+                   "#999966",
+                   "#9999cc",
+                   "#cc9966",
+                   "#cc6666",
+                   "#cc9999",
+                   "#669999",#PAM109
+                   "#66cc99",
+                   "#99cc66",
+                   "#996699",
+                   "#cccccc",
+                   "#cccc99",
+                   "#99cccc")
+names(subjectColors) <- c("Control",
+                          "PAM080",
+                          "PAM096",
+                          "PAM104",
+                          "PAM105",
+                          "PAM106",
+                          "PAM107",
+                          "PAM108",
+                          "PAM109",
+                          "PAM110",
+                          "PAM111",
+                          "PAM114",
+                          "PAM117",
+                          "PAM120",
+                          "PAM126")
+
+sunsetColors <- rcartocolor::carto_pal(20, "Sunset")
+
+cytokineColors <- c("#D99DD6", "#DA54BF", "#8A72DF", "#7FD2D8", "#89E15B", "#D6E0B7", "#D3CAD4", "#7E9ECE", "#DA6779", "#87E5AC", "#B43EE4", "#DCDE63", "#D2A062") 
+
+GMCSFCols = colorRamp2(c(0, max(design$`GMCSF`, na.rm = T)), c("#FFFFFF", "#D99DD6")) 
+
+IFNGCols = colorRamp2(c(0, max(design$`IFNGamma`, na.rm = T)), c("#FFFFFF", "#DA54BF")) 
+IL2Cols = colorRamp2(c(0, max(design$`IL2`, na.rm = T)), c("#FFFFFF", "#8A72DF"))
+IL4Cols = colorRamp2(c(0, max(design$`IL4`, na.rm = T)), c("#FFFFFF", "#7FD2D8"))
+IL5Cols = colorRamp2(c(0, max(design$`IL5`, na.rm = T)), c("#FFFFFF", "#89E15B"))
+IL6Cols = colorRamp2(c(0, max(design$`IL6`, na.rm = T)), c("#FFFFFF", "#D6E0B7"))
+IL9Cols = colorRamp2(c(0, max(design$`IL9`, na.rm = T)), c("#FFFFFF", "#D3CAD4"))
+IL10Cols = colorRamp2(c(0, max(design$`IL10`, na.rm = T)), c("#FFFFFF", "#7E9ECE"))
+IL13Cols = colorRamp2(c(0, max(design$`IL13`, na.rm = T)), c("#FFFFFF", "#DA6779"))
+IL17ACols = colorRamp2(c(0, max(design$`IL17a`, na.rm = T)), c("#FFFFFF", "#87E5AC"))
+IL17FCols = colorRamp2(c(0, max(design$`IL17f`, na.rm = T)), c("#FFFFFF", "#B43EE4"))
+IL22Cols = colorRamp2(c(0, max(design$`IL22`, na.rm = T)), c("#FFFFFF", "#DCDE63"))
+TNFACols = colorRamp2(c(0, max(design$`TNFAlpha`, na.rm = T)), c("#FFFFFF", "#D2A062"))
+
+```
+
+# RNAseq Quality Control
+
+```{r set_qc_cuts}
+
+#Set QC cuts
+alignCut = 70
+totalReadsCut = 1
+medianCvCut = 0.85
+
+design$qcPass <- design$fastq_total_reads > totalReadsCut*10^6 &
+  design$pct_aligned > alignCut &
+  design$median_cv_coverage < medianCvCut 
+```
+
+## Reads per library
+
+RNA-seq library quality is assessed and low-quality libraries are removed. The plot below displays the number of reads per library, with libraries ordered from least to most reads. The horizontal line indicates `r totalReadsCut` million reads for library. No libraries had reads that fell below this cutoff. However, there were three libraries with fewer than 2.5 million reads that should be monitored in futher anlysis given their outlier status in this plot.
+
+```{r qcplots_total_reads, fig.width=7, fig.height=3.5}
+#Make a barplot of total reads. Arrange libraries from lowest number of reads to highest.
+
+gTotReads <- ggplot(data = design, 
+       aes(x=reorder(libid, fastq_total_reads),
+           y=fastq_total_reads/10^6,
+           fill = subjectID)) +
+  geom_bar(stat="identity")+
+  geom_hline(yintercept = totalReadsCut) +
+  scale_fill_manual(values = subjectColors)+
+  labs(x="Library", y="Total reads in millions", fill = "") +
+  theme(text = element_text(size=12)) +
+  theme(axis.text.x = element_blank(),
+        axis.ticks.x = element_blank())+
+  guides(fill=guide_legend(nrow=8))
+
+print(gTotReads)
+
+pdf(file.path(plots_dir,
+              "TotalReads.pdf"),
+    height=4,
+    width = 7)
+
+print(gTotReads)
+
+invisible(dev.off())
+
+
+# ggplot(data = design, 
+#        aes(x=rNAConcNgUL,
+#            y=fastq_total_reads/10^6,
+#            color = stim,
+#            shape = time)) +
+#   geom_point()+
+#   #geom_bar(stat="identity")+
+#   geom_hline(yintercept = total_reads_cut) +
+#   scale_color_manual(values = stim_colors)+
+#   labs(x="RNAconc", y="Total reads in millions", fill = "") +
+#   theme(text = element_text(size=12)) +
+#   theme(axis.text.x = element_blank(),
+#         axis.ticks.x = element_blank())+
+#   guides(fill=guide_legend(nrow=8))
+# 
+# ggplot(data = design, 
+#        aes(x=reorder(libid, rNAConcNgUL),
+#            y=rNAConcNgUL,
+#            fill = stim)) +
+#   geom_bar(stat="identity")+
+#   #geom_hline(yintercept = total_reads_cut) +
+#   scale_fill_manual(values = stim_colors)+
+#   labs(x="Library", y="RNA concentration, Ng/ul", fill = "") +
+#   theme(text = element_text(size=12)) +
+#   theme(axis.text.x = element_blank(),
+#         axis.ticks.x = element_blank())+
+#   guides(fill=guide_legend(nrow=8))
+
+```
+
+## Percent alignment and gene coverage
+
+The following plot shows percent alignment (higher is better) and the median CV of coverage (a measure of how evenly reads cover genes, lower is better) of samples that passed the cutoff for number of reads. Lines marking the position of quality control cuts are shown. Samples in the upper left box pass quality control. The cutoffs select libraries with alignment over `r alignCut`% and a median CV of coverage of less than `r medianCvCut`. All samples that pass the total reads cut also pass the median CV and percent alignment cuts.
+
+```{r qc_cut_plot, fig.width=6, fig.height=4}
+
+plotLayers <- list( labs(x="Median CV coverage", 
+       y = "Percent alignment", 
+       color=""),
+  geom_hline(yintercept =  alignCut),
+  geom_vline(xintercept =  medianCvCut),
+  ylim(c(0,100)),
+  xlim(c(0,1.1)),
+  theme(text = element_text(size=12)))
+
+gAlignStim <- ggplot(data = design) +
+  geom_point(aes(x=median_cv_coverage, 
+                 y=pct_aligned,
+                 color=stim),
+             size=1.5) + 
+  scale_color_manual(values = stimColors) +
+  plotLayers
+
+gAlignSort <- ggplot(data = design) +
+  geom_point(aes(x=median_cv_coverage, 
+                 y=pct_aligned,
+                 color=stimSort),
+             size=1.5) + 
+  scale_color_manual(values = stimSortColors) +
+  plotLayers
+
+gSubject <- ggplot(data = design) +
+  geom_point(aes(x=median_cv_coverage, 
+                 y=pct_aligned,
+                   color=subjectID),
+             size=1.5) + 
+  scale_color_manual(values = subjectColors) +
+  plotLayers
+
+print(gSubject)
+
+pdf(file.path(plots_dir,
+              "MedianCVvsPctAligned.pdf"),
+    height=4,
+    width = 6)
+
+print(gSubject)
+
+invisible(dev.off())
+
+```
+
+```{r make_qc_cuts}
+
+designQC <- design %>% 
+  dplyr::filter(qcPass ==TRUE) %>%
+  dplyr::filter(!(subjectID == "PAM096"))
+
+countsQC <- counts[,colnames(counts) %in% designQC$libid]
+
+#Make sure libraries in counts and metrics are in the same order
+libOrder <- match(colnames(countsQC), designQC$libid)
+designQC <- designQC[libOrder,]
+
+pctPassQC <- round(nrow(designQC)/nrow(design) *100)
+```
+
+All samples treated with supernatant from PAM096 have worse alignment than other samples. While some PAM096 samples fall above the 75% treshold for percent alignment, the separation of these from other samples indicates quality issues with these. PAM096 samples are excluded from further analysis.
+
+Overall, out of `r nrow(design)` libraries, `r nrow(designQC)`, (`r pctPassQC`%) libraries passed quality control.
+
+```{r gene_filtering}
+
+## Keep protein coding genes with HGNC symbols, and drop non-protein-coding genes
+
+v38 <- annotables::grch38
+pc38 <- v38[v38$biotype == "protein_coding",] # grab protein coding
+pcWithNoSymbol <- pc38[pc38$symbol == "",] # protein coding that have no symbol
+pcWithSymbol <- pc38[pc38$symbol != "",] # get the protein coding entries that have symbols
+
+countsWithSymbol <- countsQC[rownames(countsQC) %in% pcWithSymbol$ensgene,] # make a counts matrix that is protein coding and has symbols
+
+countsWithSymbol <- as.data.frame(countsWithSymbol)
+
+countsWithSymbol$gene <- pcWithSymbol$symbol[match(rownames(countsWithSymbol),
+                                                            pcWithSymbol$ensgene)]
+
+## use data.table to aggregate/sum counts for duplicated HGNC symbols (way faster than stats::aggregate)
+
+# this also drops rows with HGNC.symbols==NA, which should include any non-protein-coding genes
+
+countsPC <- countsWithSymbol %>%
+  dplyr::group_by(gene) %>%
+  dplyr::summarise(across(starts_with("lib"), sum)) %>%
+  arrange(gene) %>%
+    dplyr::filter(gene != "MTRNR2L1") %>% # exclude MTRNR2L1
+    as.data.frame() %>%
+    magrittr::set_rownames(., value=.$gene)
+
+countsPC <- countsPC[, -which(colnames(countsPC) == "gene")]
+
+## filter lowly expressed genes
+
+#Define a function to filter out lowly expressed genes
+gene_filter <- function(counts_in, 
+                        per_cutoff = 0.1,
+                        counts_cutoff = 1){
+  #Keep genes with cpm of at least counts_cutoff in at least per_cutoff fraction of libraries
+  #CPM normalize
+  counts_cpm_norm <- as.data.frame(t(t(counts_in*10^6)/colSums(counts_in)))
+  
+  #Filter out lowly expressed genes
+  keepRows <- rowSums((counts_cpm_norm) >= counts_cutoff) >= per_cutoff*ncol(counts_cpm_norm)
+  counts_filtered <- counts_in[keepRows,]
+  
+  return(counts_filtered)
+  
+}
+
+#Run function to filter lowly expressed genes
+#counts_all_filtered <- gene_filter(counts_hgnc, 0.10) #all genes with HGNC symbols
+countsPCFiltered <- gene_filter(countsPC, 0.10, 1)
+
+normalize_counts <- function(counts_in, method){
+  #normalize using tmm or deconvolution
+  #tmm is good for bulk RNAseq
+  #deconvolution is best for large datasets of single cell RNAseq
+  #deconvolution is NOT recommended for smaller datasets (less than a few hundred cells)
+  
+  if(method == "decon"){
+  #Normalize using the deconvolution algorithm
+  decon_norm_factors <- computeSumFactors(as.matrix(counts_in))
+  counts_norm <- as.data.frame(t(t(counts_in)/decon_norm_factors))
+  }
+  
+  if(method == "tmm"){
+  #Normalize using the TMM algorithm 
+  dge <- DGEList(counts_in)
+  dge <- calcNormFactors(dge)
+  counts_norm <- cpm(dge, normalized.lib.sizes=TRUE)
+  }
+  
+  return(counts_norm)
+  
+}
+
+countsPCNorm <- normalize_counts(countsPCFiltered, "tmm")
+#counts_all_norm <- normalize_counts(counts_all_filtered, "tmm")
+
+#Write out normalized counts 
+#Add HGNC symbols to gene names
+#log 2 transform
+
+countsOut <- log2(countsPCNorm+1)
+
+write.csv(countsOut, file.path(data_dir,"TMM_normalized_log2_transformed_counts.csv"), quote=FALSE, row.names = TRUE) 
+
+```
+
+```{r subset_fib_ker_separately}
+
+#Subset for downstream analysis
+
+designFib <- designQC %>%
+  dplyr::filter(cellType == "Fibroblasts") 
+
+designKer <- designQC %>%
+  dplyr::filter(cellType == "Keratinocytes") 
+
+countsFib <- countsPCNorm[,designFib$libid]
+countsKer <- countsPCNorm[,designKer$libid]
+
+# save(countsSup,
+#      annoSup,
+#      file = file.path(data_dir, "TCellSupStimTMMCounts.RData"))
+
+```
+
+# Cytokine assay data
+
+## Cytokine expression visualizations
+
+The plots below show cytokine expression from T-cell or control cultures. In cases where the expression data for a given cytokine was at the upper (or lower) limit of detection, the value was replaced with the upper(lower) limit of detection.
+
+### Boxplots
+
+```{r plot_cytokines, fig.width=11, fig.height=10}
+#Cytokine data appears twice in the table - one in a fib row and once in a ker row. Controls are problematic since they all have the same subjectID. There were 14 total (7 ker+ 7 fib), so to get the unique set of cytokine data, the controls from one cell type can be used. 
+
+cytokineSummaryCases <- designQC %>%
+  dplyr::filter(stimSort != "UnstimulatedControl") %>%
+  dplyr::mutate(subjectIDUnique = subjectID) %>%
+  pivot_longer(cols = cytokineCols,
+               names_to = "cytokine",
+               values_to = "value") %>%
+  dplyr::select(subjectID,
+                subjectIDUnique,
+                cytokine,
+                stimSort,
+                stim,
+                value) %>%
+  unique()
+
+cytokineSummaryControls <- designQC %>%
+  dplyr::filter(stimSort == "UnstimulatedControl",
+                cellType == "Fibroblasts") %>%
+  dplyr::mutate(subjectIDUnique = make.unique(as.character(subjectID), sep = "_")) %>%
+  pivot_longer(cols = cytokineCols,
+               names_to = "cytokine",
+               values_to = "value") %>%
+  dplyr::select(subjectID,
+                subjectIDUnique,
+                cytokine,
+                stimSort,
+                stim, 
+                value) 
+
+cytokineSummary <- bind_rows(cytokineSummaryCases,
+                             cytokineSummaryControls)
+
+remove(cytokineSummaryCases, cytokineSummaryControls)
+
+cytokineSummary %>%
+  ggplot(aes(x = stimSort,
+                             y = value,
+                             #fill = stim,
+                             color = stimSort,
+             shape = stim))+
+  geom_boxplot(outlier.shape = NA)+
+  geom_quasirandom(dodge.width = 0.8)+
+  #scale_fill_manual(values = stim_colors)+
+  scale_color_manual(values = stimSortColors)+
+  scale_shape_manual(values = c(1, 16, 17)) +
+  #scale_y_continuous(limits = c(0, NA))+
+  labs(x = "",
+       y = "Cytokine expression",
+       #fill = "",
+       color = "")+
+  facet_wrap(~cytokine,
+             ncol = 3,
+            scales = "free_y")+
+  theme(axis.text.x = element_text(angle = 60, hjust = 1), 
+        text = element_text(size=12))
+
+```
+
+```{r plot_cytokines}
+
+
+#Plot with axis breaks
+
+plotLayers <- list(geom_boxplot(color = "black",
+                                outlier.shape = NA),
+                   geom_quasirandom(aes(color = stimSort,
+                                        shape = stim),
+                                    dodge.width = 0.8),
+                   scale_color_manual(values = stimSortColors),
+                   scale_shape_manual(values = stimShapes),
+                   #scale_y_continuous(limits = c(0, NA))+
+                   labs(x = "",
+                        y = "Cytokine expression (pg/mL)",
+                        #fill = "",
+                        color = ""),
+  
+  theme(axis.text.x = element_text(angle = 90, hjust = 1),
+        text = element_text(size=14)),
+  guides(color = "none",
+         shape = "none"))
+
+gIFNG <- cytokineSummary %>%
+  dplyr::filter(cytokine == "IFNGamma") %>%
+  ggplot( aes(x = stimSort,
+              y = value,
+              shape = stim))+
+  plotLayers 
+
+pdf(file.path(plots_dir, 
+              "SelectedCytokineAssayBoxPlotsIFNG.pdf"),
+    onefile = F,
+    height = 5,
+    width = 3.25)
+
+print(gIFNG)
+
+invisible(dev.off())
+
+gIL4 <- cytokineSummary %>%
+  dplyr::filter(cytokine == "IL4") %>%
+  ggplot( aes(x = stimSort,
+              y = value))+
+  plotLayers 
+
+pdf(file.path(plots_dir, 
+              "SelectedCytokineAssayBoxPlotsIL4.pdf"),
+    onefile = F,
+    height = 5,
+    width = 3.25)
+
+print(gIL4)
+
+invisible(dev.off())
+
+
+gIL5 <- cytokineSummary %>%
+  dplyr::filter(cytokine == "IL5") %>%
+  ggplot( aes(x = stimSort,
+              y = value))+
+  plotLayers+
+  ylim(c(0,6500))+
+  scale_y_break(c(2000, 6000)) 
+
+pdf(file.path(plots_dir, 
+              "SelectedCytokineAssayBoxPlotsIL5.pdf"),
+    onefile = F,
+    height = 5.35,
+    width = 4)
+
+print(gIL5)
+
+invisible(dev.off())
+
+
+gIL13 <- cytokineSummary %>%
+  dplyr::filter(cytokine == "IL13") %>%
+  ggplot( aes(x = stimSort,
+              y = value))+
+  plotLayers 
+
+pdf(file.path(plots_dir, 
+              "SelectedCytokineAssayBoxPlotsIL13.pdf"),
+    onefile = F,
+    height = 5,
+    width = 3.25)
+
+print(gIL13)
+
+invisible(dev.off())
+
+gIL17a <- cytokineSummary %>%
+  dplyr::filter(cytokine == "IL17a") %>%
+  ggplot( aes(x = stimSort,
+              y = value))+
+ plotLayers+
+  ylim(c(0,14000))+
+  scale_y_break(c(5000, 13000))
+
+pdf(file.path(plots_dir, 
+              "SelectedCytokineAssayBoxPlotsIL17A.pdf"),
+    onefile = F,
+    height = 5.35,
+    width = 4.15)
+
+print(gIL17a)
+
+invisible(dev.off())
+
+gIL17f <- cytokineSummary %>%
+  dplyr::filter(cytokine == "IL17f") %>%
+  ggplot( aes(x = stimSort,
+              y = value))+
+  plotLayers+
+  ylim(c(0,8500))+
+  scale_y_break(c(5000, 7500)) 
+
+pdf(file.path(plots_dir, 
+              "SelectedCytokineAssayBoxPlotsIL17F.pdf"),
+    onefile = F,
+    height = 5.35,
+    width = 4)
+
+print(gIL17f)
+
+invisible(dev.off())
+
+gIL22 <- cytokineSummary %>%
+  dplyr::filter(cytokine == "IL22") %>%
+  ggplot( aes(x = stimSort,
+              y = value))+
+  plotLayers 
+
+pdf(file.path(plots_dir, 
+              "SelectedCytokineAssayBoxPlotsIL22.pdf"),
+    onefile = F,
+    height = 5,
+    width = 3.25)
+
+print(gIL22)
+
+invisible(dev.off())
+
+gTNFa <- cytokineSummary %>%
+  dplyr::filter(cytokine == "TNFAlpha") %>%
+  ggplot( aes(x = stimSort,
+              y = value))+
+  plotLayers 
+
+pdf(file.path(plots_dir, 
+              "SelectedCytokineAssayBoxPlotsTNFa.pdf"),
+    onefile = F,
+    height = 5,
+    width = 3.25)
+
+print(gTNFa)
+
+invisible(dev.off())
+
+gGMCSF <- cytokineSummary %>%
+  dplyr::filter(cytokine == "GMCSF") %>%
+  ggplot( aes(x = stimSort,
+              y = value))+
+  plotLayers
+
+pdf(file.path(plots_dir,
+              "SelectedCytokineAssayBoxPlotsGMCSF.pdf"),
+    onefile = F,
+    height = 5,
+    width = 3.25)
+
+print(gGMCSF)
+
+invisible(dev.off())
+
+gIL10 <- cytokineSummary %>%
+  dplyr::filter(cytokine == "IL10") %>%
+  ggplot( aes(x = stimSort,
+              y = value))+
+  plotLayers
+
+pdf(file.path(plots_dir,
+              "SelectedCytokineAssayBoxPlotsIL10.pdf"),
+    onefile = F,
+    height = 5,
+    width = 3.25)
+
+print(gIL10)
+
+invisible(dev.off())
+
+gIL2 <- cytokineSummary %>%
+  dplyr::filter(cytokine == "IL2") %>%
+  ggplot( aes(x = stimSort,
+              y = value))+
+  plotLayers
+
+pdf(file.path(plots_dir,
+              "SelectedCytokineAssayBoxPlotsIL2.pdf"),
+    onefile = F,
+    height = 5,
+    width = 3.25)
+
+print(gIL2)
+
+invisible(dev.off())
+
+gIL6 <- cytokineSummary %>%
+  dplyr::filter(cytokine == "IL6") %>%
+  ggplot( aes(x = stimSort,
+              y = value))+
+  plotLayers
+
+pdf(file.path(plots_dir,
+              "SelectedCytokineAssayBoxPlotsIL6.pdf"),
+    onefile = F,
+    height = 5,
+    width = 3.25)
+
+print(gIL6)
+
+invisible(dev.off())
+
+gIL9 <- cytokineSummary %>%
+  dplyr::filter(cytokine == "IL9") %>%
+  ggplot( aes(x = stimSort,
+              y = value))+
+  plotLayers
+
+pdf(file.path(plots_dir,
+              "SelectedCytokineAssayBoxPlotsIL9.pdf"),
+    onefile = F,
+    height = 5,
+    width = 3.25)
+
+print(gIL9)
+
+invisible(dev.off())
+
+```
+
+```{r cytokine_statistics}
+
+
+cytokineStatsKW <- cytokineSummary %>%
+  dplyr::group_by(cytokine) %>%
+  rstatix::kruskal_test(value ~ stimSort)
+
+cytokineStatsDunnPostHoc <- cytokineSummary %>%
+  dplyr::group_by(cytokine) %>%
+  rstatix::dunn_test(value ~ stimSort, p.adjust.method = "bonferroni")
+
+write.csv(cytokineStatsKW, file.path(tables_dir, "CytokineStatsKruskalWallisTest.csv"), quote=FALSE, row.names = FALSE)
+write.csv(cytokineStatsDunnPostHoc, file.path(tables_dir, "CytokineStatsDunnPostHocComparisons.csv"), quote=FALSE, row.names = FALSE)
+```
+
+# Principal Component Analysis
+
+Principal component analysis was used to look for trends in gene expression in an unbiased manner.
+
+```{r pca_plots}
+
+make_pca_plots <- function(pdatscores_in = pdatscores,
+                           xLabString = "PC1",
+                           yLabString = "PC2",
+                           filename_prefix = "PCA",
+                           pt_size = 2,
+                           font_size = 10)  {
+  
+  
+
+plot_layers <- list(labs(x = xLabString, 
+                         y = yLabString),
+                 theme(text = element_text(size=font_size),
+                       aspect.ratio = 1)) 
+
+g_pca_stim <- ggplot() + 
+  geom_point(data = pdatscores_in, 
+             aes(x = PC1, 
+                 y = PC2, 
+                 shape = stim),
+             color = "black",
+             size=pt_size) +
+  scale_shape_manual(values = stimShapes,
+                     name = "T cell source") +
+  plot_layers
+
+g_pca_stim_sort <- ggplot() + 
+  geom_point(data = pdatscores_in, 
+              aes(x = PC1, 
+                 y = PC2, 
+                 color = stimSort,
+                 shape = stim),
+             size=pt_size) +
+  scale_color_manual(values = stimSortColors,
+                     name = "T cell sort") +
+  scale_shape_manual(values = stimShapes,
+                     name = "T cell source") +
+  plot_layers +
+  guides(colour = guide_legend(nrow = 4))
+
+g_pca_subject <- ggplot() + 
+  geom_point(data = pdatscores_in, 
+             aes(x = PC1, 
+                 y = PC2,  
+                 color = subjectID,
+                 shape = stim),
+             size=pt_size) +
+  scale_color_manual(values = subjectColors,
+                     name = "T cell donor") +
+  scale_shape_manual(values = stimShapes,
+                     name = "T cell source") +
+  plot_layers +
+  guides(colour = guide_legend(nrow = 5))
+
+egg::ggarrange(g_pca_stim,
+               g_pca_stim_sort,
+               g_pca_subject,
+               nrow = 1)
+
+filename_out <- paste0(filename_prefix,
+                      ".pdf")
+
+file_out = file.path(plots_dir, filename_out)
+
+pdf(file_out,
+    height = 4,
+    width = 16,
+    onefile = F)
+
+egg::ggarrange(g_pca_stim,
+               g_pca_stim_sort,
+               g_pca_subject,
+               nrow = 1)
+
+invisible(dev.off())
+
+  return() 
+}
+
+```
+
+
+## Fibroblasts
+
+```{r pca_fib}
+#Run PCA on the normalized log2 transformed counts data
+pcaFib = prcomp(log2(as.data.frame(t(countsFib))+1), center=TRUE, scale=FALSE)
+
+#Get PCA resutls and merge with sample information stored in metrics
+sumPcaFib = summary(pcaFib)
+pcaScoresFib = as.data.frame(pcaFib$x)
+
+pdatscoresFib <- merge(designFib, pcaScoresFib, by.x = "libid", by.y="row.names")
+pc1LabFib = paste("PC1 (", round(100*sumPcaFib$importance[2, 1], 1),  "%)", sep="")
+pc2LabFib = paste("PC2 (", round(100*sumPcaFib$importance[2, 2], 1),  "%)", sep="")
+
+```
+
+```{r pca_plots_pc1_pc2_fib, fig.width=11, fig.height=7, dependson="pca_plotting_func"}
+
+make_pca_plots(pdatscoresFib,
+               xLabString = pc1LabFib,
+               yLabString = pc2LabFib,
+               filename_prefix = "PCAFibroblasts")
+
+```
+
+## Keratinocytes
+
+```{r pca_ker}
+
+#Run PCA on the normalized log2 transformed counts data
+pcaKer = prcomp(log2(as.data.frame(t(countsKer))+1), center=TRUE, scale=FALSE)
+
+#Get PCA resutls and merge with sample information stored in metrics
+sumPcaKer = summary(pcaKer)
+pcaScoresKer = as.data.frame(pcaKer$x)
+
+pdatscoresKer <- merge(designKer, pcaScoresKer, by.x = "libid", by.y="row.names")
+pc1LabKer = paste("PC1 (", round(100*sumPcaKer$importance[2, 1], 1),  "%)", sep="")
+pc2LabKer = paste("PC2 (", round(100*sumPcaKer$importance[2, 2], 1),  "%)", sep="")
+
+```
+
+```{r pca_plots_pc1_pc2_ker, fig.width=11, fig.height=7, dependson="pca_plotting_func"}
+
+make_pca_plots(pdatscoresKer,
+               xLabString = pc1LabKer,
+               yLabString = pc2LabKer,
+               filename_prefix = "PCAKeratinocytes")
+
+```
+
+# Selected gene expression
+
+```{r plot_gene}
+#Gene and pathway analysis
+
+plot_gene <- function(gene,
+                      counts_in,
+                      design_in,
+                      cellType = "KC",
+                      save_plot = FALSE,
+                      log_scale = FALSE){
+ 
+  #Make sure libs in design and counts are in the same order
+  if(sum(design_in$libid != colnames(counts_in))!= 0){
+    print("Check to make sure the order of libraries in counts and design match")
+    return(NULL)}
+  
+  #Add gene count into to design_in
+  
+  design_in$gene <- counts_in[rownames(counts_in) == gene,]
+  
+  if(log_scale == TRUE){
+    design_in$gene <- log2(design_in$gene +1)
+  }
+
+  g_gene_exp <- ggplot(design_in,
+           aes(x = stimSort,
+               y = gene,
+               shape = stim, 
+               color = stimSort))+
+      geom_boxplot(outlier.shape = NA)+
+      geom_quasirandom(dodge.width = 0.8)+
+      #scale_fill_manual(values = stim_colors)+
+      scale_color_manual(values = stimSortColors)+
+    scale_shape_manual(values = stimShapes)+
+      #scale_y_continuous(limits = c(0, NA))+
+      labs(x = "",
+           y = paste0("log2 TMM counts"),
+           title = gene, 
+           #fill = "",
+           color = "")+
+      theme(axis.text.x = element_text(angle = 90, hjust = 1), 
+            text = element_text(size=12),
+            plot.title = element_text(hjust = 0.5)) +
+    guides(color="none",
+           shape = "none")
+  
+   if(save_plot == TRUE){
+     
+     if(cellType == "KC"){
+  filename <- file.path(plots_dir,
+                        paste(gene, "Log2CountsKC.pdf", sep = "_"))}
+  else if(cellType == "FB"){
+   filename <- file.path(plots_dir,
+                        paste(gene, "Log2CountsFB.pdf", sep = "_"))}
+     
+  pdf(filename,
+      height = 4,
+      width = 2.5,
+      useDingbats = F)
+  print(g_gene_exp)
+  invisible(dev.off())
+  
+  }
+  
+  #print(g_gene_exp)
+  
+  return(g_gene_exp)
+}
+
+```
+
+# Cytokine receptors
+
+```{r read_in_receptors}
+
+# receptors <- read.csv(file.path(tables_dir, "KC_Fib receptor expression.csv"))
+# 
+# receptors$Cytokine[receptors$Cytokine == ""] <- NA
+# 
+# receptors <- receptors %>% tidyr::fill(Cytokine)
+
+#Specify receptor genes
+
+receptorGenes <- c("CSF2RA",
+                   "CSF2RB",
+                   "IFNGR1",
+                   "IFNGR2",
+                   "IL2RG",
+                   "IL4R",
+                   "IL6R",
+                   "IL6ST",
+                   "IL10RA",
+                   "IL10RB",
+                   "IL13RA1",
+                   "IL13RA2",
+                   "IL17RA",
+                   "IL17RC",
+                   "IL22RA1",
+                   "IL31RA",
+                   "OSMR",
+                   "TGFBR1",
+                   "TGFBR2",
+                   "TNFRSF1A",
+                   "TNFRSF1B") 
+
+```
+
+```{r cytokine_receptors_single_plots}
+
+plot_many_genes <- function(genes,
+                      counts_in,
+                      design_in,
+                      cellType = "KC",
+                      save_plot = FALSE,
+                      log_scale = FALSE){
+ 
+  #Make sure libs in design and counts are in the same order
+  if(sum(design_in$libid != colnames(counts_in))!= 0){
+    print("Check to make sure the order of libraries in counts and design match")
+    return(NULL)}
+  
+  #Add gene counts into to design_in
+  gene_counts <- counts_in[genes,design_in$libid] %>% t()
+  
+  if(log_scale == TRUE){
+    gene_counts <- log2(gene_counts + 1)
+  }
+  
+  design_in <- cbind(design_in, gene_counts)
+  
+  design_in <- design_in %>%
+    pivot_longer(cols = all_of(genes),
+                 names_to = "gene",
+                 values_to = "counts")
+
+  g_gene_exp <- ggplot(design_in,
+           aes(x = stimSort,
+               y = counts,
+               shape = stim, 
+               color = stimSort))+
+      geom_boxplot(outlier.shape = NA)+
+      geom_quasirandom(dodge.width = 0.8)+
+      #scale_fill_manual(values = stim_colors)+
+      scale_color_manual(values = stimSortColors)+
+    scale_shape_manual(values = stimShapes)+
+      #scale_y_continuous(limits = c(0, NA))+
+      labs(x = "",
+           y = paste0("log2 TMM counts"),
+           #fill = "",
+           color = "")+
+      theme(axis.text.x = element_text(angle = 90, hjust = 1), 
+            text = element_text(size=12),
+            plot.title = element_text(hjust = 0.5)) +
+    guides(color="none",
+           shape = "none")+
+    facet_wrap(~gene, scales = "free_y")
+  
+   if(save_plot == TRUE){
+     
+     if(cellType == "KC"){
+  filename <- file.path(plots_dir, "AllReceptorsLog2CountsKC.pdf")}
+  else if(cellType == "FB"){
+   filename <- file.path(plots_dir,"AllReceptorsLog2CountsFB.pdf")}
+     
+  pdf(filename,
+      height = 10,
+      width = 8,
+      useDingbats = F)
+  print(g_gene_exp)
+  invisible(dev.off())
+  
+  }
+  
+  #print(g_gene_exp)
+  
+  return(g_gene_exp)
+}
+
+plot_many_genes(receptorGenes, countsFib, designFib, cellType = "FB", save_plot = TRUE, log_scale = TRUE)
+plot_many_genes(receptorGenes, countsKer, designKer, cellType = "KC", save_plot = TRUE, log_scale = TRUE)
+
+```
+
+```{r compute_receptor_stats}
+
+fibReceptorStatsKW <- cbind(designFib, t(countsFib[receptorGenes,])) %>%
+  pivot_longer(cols = all_of(receptorGenes),
+               names_to = "gene",
+               values_to = "counts") %>%
+  dplyr::mutate(counts = log2(counts+1)) %>%
+  dplyr::group_by(gene) %>%
+  rstatix::kruskal_test(counts~stimSort)
+
+fibReceptorStatsDunn <- cbind(designFib, t(countsFib[receptorGenes,])) %>%
+  pivot_longer(cols = all_of(receptorGenes),
+               names_to = "gene",
+               values_to = "counts") %>%
+  dplyr::mutate(counts = log2(counts+1)) %>%
+  dplyr::group_by(gene) %>%
+  rstatix::dunn_test(counts ~ stimSort, p.adjust.method = "bonferroni")
+
+
+kerReceptorStatsKW <- cbind(designKer, t(countsKer[receptorGenes,])) %>%
+  pivot_longer(cols = all_of(receptorGenes),
+               names_to = "gene",
+               values_to = "counts") %>%
+  dplyr::mutate(counts = log2(counts+1)) %>%
+  dplyr::group_by(gene) %>%
+  rstatix::kruskal_test(counts~stimSort)
+
+kerReceptorStatsDunn <- cbind(designKer, t(countsKer[receptorGenes,])) %>%
+  pivot_longer(cols = all_of(receptorGenes),
+               names_to = "gene",
+               values_to = "counts") %>%
+  dplyr::mutate(counts = log2(counts+1)) %>%
+  dplyr::group_by(gene) %>%
+  rstatix::dunn_test(counts ~ stimSort, p.adjust.method = "bonferroni")
+
+write.csv(fibReceptorStatsKW, file.path(tables_dir, "FibroblastGeneExprCytokineReceptorStatsKruskalWallisTest.csv"), quote=FALSE, row.names = FALSE)
+write.csv(fibReceptorStatsDunn, file.path(tables_dir, "FibroblastGeneExprCytokineReceptorStatsDunnPostHocComparisons.csv"), quote=FALSE, row.names = FALSE)
+
+write.csv(kerReceptorStatsKW, file.path(tables_dir, "KeratinocyteGeneExprCytokineReceptorStatsKruskalWallisTest.csv"), quote=FALSE, row.names = FALSE)
+write.csv(kerReceptorStatsDunn, file.path(tables_dir, "KeratinocyteGeneExprCytokineReceptorStatsDunnPostHocComparisons.csv"), quote=FALSE, row.names = FALSE)
+```
+
+# Differential expression
+
+```{r make_volcano_plots}
+
+plot_volcano <- function(top_table_in,
+                         fc_cutoff = 1,
+                         p_cutoff = 0.05,
+                         fc_for_anno = 2.5,
+                         p_for_anno = 0.1,
+                         y_max = 2.5,
+                         title = "",
+                         color_values = c("darkcyan", "red"),
+                         color_labels = NULL,
+                         anno_type = "or"){
+  
+  top_table_in$gene_name <- rownames(top_table_in)
+
+  if(anno_type == "or"){
+    selected_genes <- top_table_in %>%
+  dplyr::filter(abs(logFC) > fc_for_anno | adj.P.Val < p_for_anno)
+  }
+  
+  if(anno_type == "and"){
+    selected_genes <- top_table_in %>%
+  dplyr::filter(abs(logFC) > fc_for_anno & adj.P.Val < p_for_anno)
+  }
+  
+  if(anno_type == "top20"){
+    selected_genes <- top_table_in[1:20,]
+  }
+
+g_volcano <- ggplot(data = top_table_in, aes(x=logFC, y=-log10(adj.P.Val), color = logFC>0)) +
+  ggrastr::rasterize(geom_point(alpha=0.7, size=2.5, shape = 19), dpi = 300) +
+  #theme(legend.position = "none") +
+  scale_color_manual(values = color_values, name = "", labels = color_labels)+
+  xlab("log2 fold change") + ylab("-log10 FDR")+ ggtitle(title) +
+  geom_vline(xintercept=fc_cutoff, color="black", linetype="dotted",size=1.0) +
+  geom_vline(xintercept=-1*fc_cutoff, color="black", linetype="dotted",size=1.0)+
+  geom_hline(yintercept=-log10(p_cutoff), color="black",linetype="dotted",size=1.0)+
+   geom_text_repel(data = selected_genes,
+             aes(x=logFC, y=-log10(adj.P.Val),label=gene_name), 
+             size=2.5, 
+             #vjust=1,
+             #hjust=0.5,
+             max.overlaps = Inf,
+             color="black")+
+  ylim(c(0,y_max))+
+  theme(text = element_text(size=12))
+
+return(g_volcano)
+
+}
+```
+
+```{r de_functions}
+save_DE_table <- function(top_genes, out_file){
+  top_genes$Gene <- rownames(top_genes)
+  top_genes <- top_genes %>%
+    dplyr::rename(log2FoldChange = logFC,
+                  pValue = P.Value,
+                  MultipleTestingCorrectedFDR = adj.P.Val) %>%
+    dplyr::select(Gene, log2FoldChange, pValue, MultipleTestingCorrectedFDR)
+  
+  write.csv(top_genes,
+            file.path(tables_dir,
+                      out_file),
+            row.names = F,
+            quote=F)
+}
+
+save_sig_table <- function(top_genes, 
+                           out_file,
+                           fdr_cut = 0.05,
+                           lfc_cut = 1){
+  
+  top_genes$Gene <- rownames(top_genes)
+  sig_genes <- top_genes %>%
+    dplyr::rename(log2FoldChange = logFC,
+                  pValue = P.Value,
+                  MultipleTestingCorrectedFDR = adj.P.Val) %>%
+    dplyr::filter(MultipleTestingCorrectedFDR <= fdr_cut,
+                  abs(log2FoldChange) >= lfc_cut) %>%
+    dplyr::select(Gene, log2FoldChange, pValue, MultipleTestingCorrectedFDR)
+  
+  write.csv(sig_genes,
+            file.path(tables_dir,
+                      out_file),
+            row.names = F,
+            quote=F)
+}
+
+get_sig_genes <- function(top_genes,
+                          lfc_cutoff = 1,
+                          fdr_cutoff = 0.05){
+  
+  top_genes$gene <- rownames(top_genes)
+  
+  sig_table <- top_genes %>%
+    dplyr::filter(abs(logFC) > lfc_cutoff,
+                  adj.P.Val < fdr_cutoff)
+  
+  sig_genes <- sig_table$gene
+  return(sig_genes)
+
+}
+
+get_top_n_genes <- function(top_genes,
+                            n = 20){
+  
+  top_genes$gene <- rownames(top_genes)
+  
+  top_n_table <- top_genes %>%
+    dplyr::arrange(adj.P.Val)
+  
+  top_n_table <- top_n_table[1:n,]
+  
+  top_n_genes <- top_n_table$gene
+  
+  return(top_n_genes)
+
+}
+
+save_sig_table_F <- function(top_genes, 
+                           out_file,
+                           fdr_cut = 0.05,
+                           lfc_cut = 1){
+  
+  top_genes$Gene <- rownames(top_genes)
+  sig_genes <- top_genes %>%
+    dplyr::rename(pValue = P.Value,
+                  MultipleTestingCorrectedFDR = adj.P.Val) %>%
+    dplyr::filter(MultipleTestingCorrectedFDR <= fdr_cut)
+  
+  write.csv(sig_genes,
+            file.path(tables_dir,
+                      out_file),
+            row.names = F,
+            quote=F)
+}
+
+
+
+getCytokineSubsetAnnotation <- function(designForHmapIn = designForHmap){
+  
+  IFNGBYCols = colorRamp2(c(0, max(designForHmap$`IFNGamma`, na.rm = T)), c("black", "gold")) 
+  
+  IL4BYCols = colorRamp2(c(0, max(designForHmap$`IL4`, na.rm = T)), c("black", "gold")) 
+  
+  IL5BYCols = colorRamp2(c(0, quantile(designForHmap$`IL5`, 0.95, na.rm = T)), c("black", "gold")) 
+  
+  IL13BYCols = colorRamp2(c(0, max(designForHmap$`IL13`, na.rm = T)), c("black", "gold")) 
+  
+  IL17ABYCols = colorRamp2(c(0, quantile(designForHmap$`IL17a`, 0.95, na.rm = T)), c("black", "gold")) 
+  
+  IL17FBYCols = colorRamp2(c(0, quantile(designForHmap$`IL17f`, 0.95, na.rm = T)), c("black", "gold")) 
+  
+  IL22BYCols = colorRamp2(c(0, max(designForHmap$`IL22`, na.rm = T)), c("black", "gold")) 
+  
+  TNFABYCols = colorRamp2(c(0, max(designForHmap$`TNFAlpha`, na.rm = T)), c("black", "gold")) 
+  
+  cytokineAnnoOut <- HeatmapAnnotation( `IFN-Gamma` = designForHmapIn[,"IFNGamma"],
+                                        `IL-4` = designForHmapIn[,"IL4"],
+                                        `IL-5` = designForHmapIn[,"IL5"],
+                                        `IL-13` = designForHmapIn[,"IL13"],
+                                        `IL-17a` = designForHmapIn[,"IL17a"],
+                                        `IL-17f` = designForHmapIn[,"IL17f"],
+                                        `IL-22` = designForHmapIn[,"IL22"],
+                                        `TNF-Alpha` = designForHmapIn[,"TNFAlpha"],
+                                        col = list(`IFN-Gamma` = IFNGBYCols,
+                                                   `IL-4` = IL4BYCols,
+                                                   `IL-5` = IL5BYCols,
+                                                   `IL-13` = IL13BYCols,
+                                                   `IL-17a` = IL17ABYCols,
+                                                   `IL-17f` = IL17FBYCols,
+                                                   `IL-22` = IL22BYCols,
+                                                   `TNF-Alpha` = TNFABYCols),
+                                        show_annotation_name = T,
+                                        show_legend = F,
+                                        gp = gpar(col = "black")) 
+  
+  return(cytokineAnnoOut)
+  
+}
+
+```
+
+## Keratinocytes
+
+### Comparisons against all others
+
+In the following volcano plots and heatmaps, samples are grouped by type of stimulation and T-sort and compared against the average of all other samples (ie one group vs controls and other stims).
+
+```{r model_keratinocytes_one_stim_vs_av_others}
+#Differential gene expression in keratinocyte samples
+
+designMatKer <- model.matrix(~0+designKer$stimSortChar)
+
+#simplify columns names so contrasts are easier to make later
+colnames(designMatKer) <- colnames(designMatKer) %>%
+  str_remove_all("designKer|stimSortChar") %>%
+  str_remove_all("\\$")
+
+vwtsKer <- voomWithQualityWeights(countsKer, design= designMatKer, plot=F, span=0.1)
+
+#Some samples are given smaller weights than others
+#It appears to be related to T cell donor
+# designKer$vwtsWeights <- vwtsKer$targets$sample.weights[match(designKer$libid,
+#                                                              rownames(vwtsKer$targets))]
+
+# ggplot(designKer,
+#        aes(x = libid,
+#            y = vwtsWeights,
+#            fill = stimSort))+
+#   geom_col()+
+#   scale_fill_manual(values = stimSortColors)
+# 
+# ggplot(designKer,
+#        aes(x = libid,
+#            y = vwtsWeights,
+#            fill = subjectID))+
+#   geom_col()+
+#   scale_fill_manual(values = subjectColors)
+
+
+# fit model
+vfitKer <-
+  lmFit(vwtsKer)
+
+vfitEbKer <- eBayes(vfitKer)
+
+
+nPops <- length(unique(designKer$stimSort))
+contrasts <- matrix(-1/(nPops-1), nPops, nPops) + diag(x=nPops/(nPops-1), nPops, nPops)
+colnames(contrasts) <- colnames(designMatKer)
+
+contFitKer <- contrasts.fit(vfitEbKer, contrasts)
+contFitKer <- eBayes(contFitKer)
+```
+
+```{r get_sig_genes_ker}
+
+topGenesMediaVAllCD4sKer <- topTable(contFitKer, coef = "UnstimulatedControl", sort.by = "P", number = Inf)
+
+topGenesBloodCD4Th1VAllCD4sKer <- topTable(contFitKer, coef = "BloodCD4posCLAposTh1", sort.by = "P", number = Inf)
+
+topGenesBloodCD4Th2VAllCD4sKer <- topTable(contFitKer, coef = "BloodCD4posCLAposTh2", sort.by = "P", number = Inf)
+
+topGenesBloodCD4Th17VAllCD4sKer <- topTable(contFitKer, coef = "BloodCD4posCLAposTh17", sort.by = "P", number = Inf)
+
+topGenesBloodCD4Th22VAllCD4sKer <- topTable(contFitKer, coef = "BloodCD4posCLAposTh22", sort.by = "P", number = Inf)
+
+topGenesBloodCD4CD103posVAllCD4sKer <- topTable(contFitKer, coef = "BloodCD4posCLAposCD103pos", sort.by = "P", number = Inf)
+
+topGenesSkinCD4CD103negVAllCD4sKer <- topTable(contFitKer, coef = "SkinCD4posCLAposCD103neg", sort.by = "P", number = Inf)
+
+topGenesSkinCD4CD103posVAllCD4sKer <- topTable(contFitKer, coef = "SkinCD4posCLAposCD103pos", sort.by = "P", number = Inf)
+
+
+```
+
+```{r save_sig_genes_ker}
+
+openxlsx::write.xlsx(list("MediaVAllCD4sKer" = topGenesMediaVAllCD4sKer,
+                         "BloodCD4Th1VAllCD4sKer" = topGenesBloodCD4Th1VAllCD4sKer,
+                         "BloodCD4Th2VAllCD4sKer" = topGenesBloodCD4Th2VAllCD4sKer,
+                         "BloodCD4Th17VAllCD4sKer" = topGenesBloodCD4Th17VAllCD4sKer,
+                         "BloodCD4Th22VAllCD4sKer" = topGenesBloodCD4Th22VAllCD4sKer,
+                         "BloodCD4CD103posVAllCD4sKer" = topGenesBloodCD4CD103posVAllCD4sKer,
+                         "SkinCD4CD103negVAllCD4sKer" = topGenesSkinCD4CD103negVAllCD4sKer,
+                         "SkinCD4CD103posVAllCD4sKer" = topGenesSkinCD4CD103posVAllCD4sKer), 
+                     rowNames = TRUE, 
+                     file = file.path(tables_dir, "SupStimulatedKeratinocyteStatistics.xlsx"))
+
+```
+
+```{r de_vs_unstim}
+
+topGenesBloodCD4Th1VMediaKer <- topTable(vfitEbKer, coef = "BloodCD4posCLAposTh1", sort.by = "P", number = Inf)
+topGenesBloodCD4Th2VMediaKer <- topTable(vfitEbKer, coef = "BloodCD4posCLAposTh2", sort.by = "P", number = Inf)
+topGenesBloodCD4Th17VMediaKer <- topTable(vfitEbKer, coef = "BloodCD4posCLAposTh17", sort.by = "P", number = Inf)
+topGenesBloodCD4Th22VMediaKer <- topTable(vfitEbKer, coef = "BloodCD4posCLAposTh22", sort.by = "P", number = Inf)
+topGenesBloodCD4CD103posVMediaKer <- topTable(vfitEbKer, coef = "BloodCD4posCLAposCD103pos", sort.by = "P", number = Inf)
+
+topGenesSkinCD4CD103negVMediaKer <- topTable(vfitEbKer, coef = "SkinCD4posCLAposCD103neg", sort.by = "P", number = Inf)
+
+topGenesSkinCD4CD103posVMediaKer <- topTable(vfitEbKer, coef = "SkinCD4posCLAposCD103pos", sort.by = "P", number = Inf)
+
+openxlsx::write.xlsx(list("BloodCD4Th1VMediaKer" = topGenesBloodCD4Th1VMediaKer,
+                         "BloodCD4Th2VMediaKer" = topGenesBloodCD4Th2VMediaKer,
+                         "BloodCD4Th17VMediaKer" = topGenesBloodCD4Th17VMediaKer,
+                         "BloodCD4Th22VMediaKer" = topGenesBloodCD4Th22VMediaKer,
+                         "BloodCD4CD103posVMediaKer" = topGenesBloodCD4CD103posVMediaKer,
+                         "SkinCD4CD103negVMediaKer" = topGenesSkinCD4CD103negVMediaKer,
+                         "SkinCD4CD103posVMediaKer" = topGenesSkinCD4CD103posVMediaKer), 
+                     rowNames = TRUE, 
+                     file = file.path(tables_dir, "SupStimulatedKeratinocyteStatisticsVsUnstimControl.xlsx"))
+```
+
+### Volcano plots
+
+```{r volcano_plots_vs_media}
+gBloodCD4Th1 <- plot_volcano(topGenesBloodCD4Th1VAllCD4sKer, 
+                          title = "Others vs Blood CD4+CLA+Th1",
+                          color_labels = c("Down in BloodCD4+CLA+Th1", "Up in BloodCD4+CLA+Th1"), 
+                          color_values = as.vector(stimSortColors[c("UnstimulatedControl", "BloodCD4+CLA+Th1")]),
+                          y_max = 23,  
+                          anno_type = "top20")
+
+gBloodCD4Th2 <- plot_volcano(topGenesBloodCD4Th2VAllCD4sKer, 
+                          title = "Others vs Blood CD4+CLA+Th2",
+                          color_labels = c("Down in BloodCD4+CLA+Th2", "Up in BloodCD4+CLA+Th2"), 
+                          color_values = as.vector(stimSortColors[c("UnstimulatedControl", "BloodCD4+CLA+Th2")]),
+                          y_max = 20,  
+                          anno_type = "top20")
+
+gBloodCD4Th17 <- plot_volcano(topGenesBloodCD4Th17VAllCD4sKer, 
+                          title = "Others vs Blood CD4+CLA+Th17",
+                          color_labels = c("Down in BloodCD4+CLA+Th17", "Up in BloodCD4+CLA+Th17"), 
+                          color_values = as.vector(stimSortColors[c("UnstimulatedControl", "BloodCD4+CLA+Th17")]),
+                          y_max = 23,  
+                          anno_type = "top20")
+
+gBloodCD4Th22 <- plot_volcano(topGenesBloodCD4Th22VAllCD4sKer, 
+                          title = "Others vs Blood CD4+CLA+Th22",
+                          color_labels = c("Down in BloodCD4+CLA+Th22", "Up in BloodCD4+CLA+Th22"), 
+                          color_values = as.vector(stimSortColors[c("UnstimulatedControl", "BloodCD4+CLA+Th22")]),
+                          y_max = 23,  
+                          anno_type = "top20")
+
+gBloodCD4CD103pos <- plot_volcano(topGenesBloodCD4CD103posVAllCD4sKer, 
+                          title = "Others vs Blood CD4+CLA+CD103+",
+                          color_labels = c("Down in BloodCD4+CLA+CD103+", "Up in BloodCD4+CLA+CD103+"), 
+                          color_values = as.vector(stimSortColors[c("UnstimulatedControl", "BloodCD4+CLA+CD103+")]),
+                          y_max = 23,  
+                          anno_type = "top20")
+
+gSkinCD4CD103neg <- plot_volcano(topGenesSkinCD4CD103negVAllCD4sKer, 
+                          title = "Others vs Skin CD4+CLA+CD103-",
+                          color_labels = c("Down in SkinCD4+CLA+CD103-", "Up in SkinCD4+CLA+CD103-"), 
+                          color_values = as.vector(stimSortColors[c("UnstimulatedControl", "SkinCD4+CLA+CD103-")]),
+                          y_max = 23,  
+                          anno_type = "top20")
+
+gSkinCD4CD103pos <- plot_volcano(topGenesSkinCD4CD103posVAllCD4sKer, 
+                          title = "Others vs Skin CD4+CLA+CD103+",
+                          color_labels = c("Down in SkinCD4+CLA+CD103+", "Up in SkinCD4+CLA+CD103+"), 
+                          color_values = as.vector(stimSortColors[c("UnstimulatedControl", "SkinCD4+CLA+CD103+")]),
+                          y_max = 23,  
+                          anno_type = "top20")
+
+
+
+# ggpubr::ggarrange(gBloodCD4Th1,
+#                   gBloodCD4Th2,
+#                   gBloodCD4Th17,
+#                   gBloodCD4Th22,
+#                   gBloodCD4CD103pos,
+#                   gSkinCD4CD103neg,
+#                   gSkinCD4CD103pos,
+#                   ncol=2,
+#                   nrow=4,
+#                   common.legend = FALSE)
+
+pdf(file.path(plots_dir, "VolcanoPlotsKeratinocytes.pdf"),
+    height = 15,
+    width=10)
+
+ggpubr::ggarrange(gBloodCD4CD103pos+ theme(legend.position = "none"),
+                  gBloodCD4Th1+ theme(legend.position = "none"),
+                  gBloodCD4Th2+ theme(legend.position = "none"),
+                  gBloodCD4Th17+ theme(legend.position = "none"),
+                  gBloodCD4Th22+ theme(legend.position = "none"),
+                  gSkinCD4CD103neg+ theme(legend.position = "none"),
+                  gSkinCD4CD103pos+ theme(legend.position = "none"),
+                  ncol=2,
+                  nrow=4,
+                  common.legend = FALSE)
+invisible(dev.off())
+
+png(file.path(plots_dir, "VolcanoPlotsKeratinocytes.png"),
+    height = 2000,
+    width=1600)
+
+ggpubr::ggarrange(gBloodCD4CD103pos,
+                  gBloodCD4Th1,
+                  gBloodCD4Th2,
+                  gBloodCD4Th17,
+                  gBloodCD4Th22,
+                  gSkinCD4CD103neg,
+                  gSkinCD4CD103pos,
+                  ncol=2,
+                  nrow=4,
+                  common.legend = FALSE)
+
+invisible(dev.off())
+```
+
+### Heatmap
+
+The following heatmap shows the top 20 differentially expressed genes (20 smallest p-values) for each group compared against other CD4 groups.
+
+```{r heatmap_stim_vs_all_cd4s_Ker, fig.width=7, fig.height=8, dependson="de_functions"}
+
+top20GenesUnion <- Reduce(union, list(get_top_n_genes(topGenesBloodCD4Th1VAllCD4sKer),
+                                      get_top_n_genes(topGenesBloodCD4Th2VAllCD4sKer),
+                                      get_top_n_genes(topGenesBloodCD4Th17VAllCD4sKer),
+                                      get_top_n_genes(topGenesBloodCD4Th22VAllCD4sKer),
+                                      get_top_n_genes(topGenesBloodCD4CD103posVAllCD4sKer),
+                                      get_top_n_genes(topGenesSkinCD4CD103negVAllCD4sKer),
+                                      get_top_n_genes(topGenesSkinCD4CD103posVAllCD4sKer)))
+
+designForHmap <- designKer %>%
+  dplyr::filter(stimSort != "UnstimulatedControl",
+                !is.na(IL4)) %>%
+  dplyr::arrange(stimSort) %>%
+  droplevels()
+
+cytokinesForHmap <- designForHmap[, cytokineCols]
+
+countsForHmap <- log2(countsKer[top20GenesUnion,designForHmap$libid]+1)
+
+columnAnno <- HeatmapAnnotation(Stimulation = designForHmap$stimSort,
+                                Source = designForHmap$stim,
+                              col = list(Stimulation = stimSortColors,
+                                         Source = stimColors)) 
+
+columnAnno <- HeatmapAnnotation(Stimulation = designForHmap$stimSort,
+                                Source = designForHmap$stim,
+                              col = list(Stimulation = stimSortColors,
+                                         Source = stimColors)) 
+
+#Set up annotation with different shapes for different stimulations
+pchKey <- data.frame(stimSort =  c("BloodCD4+CLA+CD103+", 
+                                   "BloodCD4+CLA+Th1" ,
+                                   "BloodCD4+CLA+Th17",
+                                   "BloodCD4+CLA+Th2" ,
+                                   "BloodCD4+CLA+Th22",
+                                   "SkinCD4+CLA+CD103-",
+                                   "SkinCD4+CLA+CD103+"),
+                     shape = c(15, 15, 15, 15, 15, 1, 1),
+                     color = c(stimSortColors[c("BloodCD4+CLA+CD103+", 
+                                   "BloodCD4+CLA+Th1" ,
+                                   "BloodCD4+CLA+Th17",
+                                   "BloodCD4+CLA+Th2" ,
+                                   "BloodCD4+CLA+Th22",
+                                   "SkinCD4+CLA+CD103-",
+                                   "SkinCD4+CLA+CD103+")]))
+
+pchSymbols <- pchKey$shape[match(designForHmap$stimSort,
+                             pchKey$stimSort)]
+
+pchColors <- pchKey$color[match(designForHmap$stimSort,
+                             pchKey$stimSort)]
+
+whiteStimColors <- rep("white",length(unique(designForHmap$stimSort)))
+names(whiteStimColors) <- levels(designForHmap$stimSort)
+
+pchAnno <- HeatmapAnnotation(Source = anno_simple(as.vector(designForHmap$stimSort), 
+                                                  col = whiteStimColors,
+                                                  pt_gp = gpar(col = pchColors),
+                                                  pch = pchSymbols))
+
+cytokineAnno <- getCytokineSubsetAnnotation(designForHmap) 
+ 
+scaledCounts <- t(scale(t(countsForHmap))) 
+
+centeredCounts <- t(scale(t(countsForHmap), scale = FALSE))
+
+hmap <- Heatmap(scaledCounts,
+        name = "row z-score",
+        #cluster_columns = FALSE,
+        #cluster_rows = FALSE,
+        #row_labels = selected_genes,
+        row_names_gp = gpar(fontsize = 8),
+        #clustering_distance_columns = "manhattan",
+        #clustering_distance_rows = "manhattan",
+        top_annotation = pchAnno,
+        bottom_annotation = cytokineAnno,
+        show_column_names = FALSE,
+        show_row_names = FALSE)
+
+draw(hmap)
+
+geneDend <- row_dend(hmap)
+
+pdf(file.path(plots_dir, "HeatmapKeratinocytesStimVsAllCD4sTop20.pdf"),
+    height = 6,
+    width = 9)
+
+print(hmap)
+
+
+invisible(dev.off())
+
+```
+
+```{r heatmap_dan_selected_genes_keratinocytes}
+
+selGenes <- c("CCL2", "CIITA", "LTB", "CXCL11", "IDO1", "IL13RA2", "CCL26", "MMP7", "IL23A", "CSF3", "CXCL8", "IL17C", "TOP2A", "MKI67", "CDK1", "CDC20", "CENPA", "CENPF")
+
+selGenes <- selGenes[selGenes %in% rownames(countsFib)]
+
+designForHmap <- designKer %>%
+  dplyr::filter(stimSort != "UnstimulatedControl",
+                !is.na(IL4)) %>%
+  dplyr::arrange(stimSort) %>%
+  droplevels()
+
+countsForHmap <- countsKer[selGenes, designForHmap$libid]
+
+designEpiCountsKer <- merge(designForHmap, 
+                            t(countsForHmap),
+                            by.x="libid",
+                            by.y = "row.names")
+
+designAveraged <- designEpiCountsKer %>%
+  dplyr::group_by(stimSort) %>%
+  dplyr::summarise(across(c(cytokineCols, selGenes), ~ mean(.x))) %>%
+  droplevels() %>%
+  as.data.frame()
+
+countsAveraged <- designAveraged[, selGenes] %>% t()
+
+#Which genes are DE?
+
+sigGenesUnion <- Reduce(union, list(#get_sig_genes(topGenesMediaVAllCD4sKer),
+                                    get_sig_genes(topGenesBloodCD4Th1VAllCD4sKer),
+                                      get_sig_genes(topGenesBloodCD4Th2VAllCD4sKer),
+                                      get_sig_genes(topGenesBloodCD4Th17VAllCD4sKer),
+                                      get_sig_genes(topGenesBloodCD4Th22VAllCD4sKer),
+                                      get_sig_genes(topGenesBloodCD4CD103posVAllCD4sKer),
+                                      get_sig_genes(topGenesSkinCD4CD103negVAllCD4sKer),
+                                      get_sig_genes(topGenesSkinCD4CD103posVAllCD4sKer)))
+
+#Which genes are DE?
+deGeneStatus = ifelse(selGenes %in% sigGenesUnion, "DE", "notDE")
+whiteSigColors <- c("DE" = "white",
+                    "notDE" = "white")
+pchSig <- ifelse(selGenes %in% sigGenesUnion, "*", NA)
+
+sigAnno = rowAnnotation(    
+    Source = anno_simple(deGeneStatus, 
+                         col = whiteSigColors, 
+                         pch = pchSig)) 
+
+pchSymbols <- pchKey$shape[match(designAveraged$stimSort,
+                             pchKey$stimSort)]
+
+pchColors <- pchKey$color[match(designAveraged$stimSort,
+                             pchKey$stimSort)]
+
+whiteStimColors <- rep("white", length(unique(designAveraged$stimSort)))
+names(whiteStimColors) <- unique(designAveraged$stimSort)
+
+pchAnno = HeatmapAnnotation(    
+    Source = anno_simple(as.vector(designAveraged$stimSort), 
+                         col = whiteStimColors, 
+                         pch = pchSymbols,
+                         pt_gp = gpar(col = pchColors))) 
+
+
+cytokinesForHmap <- designAveraged[, cytokineCols]
+
+cytokineAnno <- getCytokineSubsetAnnotation(designAveraged) 
+ 
+scaledCounts <- t(scale(t(countsAveraged))) 
+
+centeredCounts <- t(scale(t(countsAveraged), scale = FALSE))
+
+hmap_z <- Heatmap(#countsAveraged,
+  scaledCounts,
+  #countsForHmap,
+  #col = epiColFun,
+  #name = "Log2 counts",
+  name = "Row z-score",
+  #cluster_columns = FALSE,
+  #cluster_rows = FALSE,
+  #row_labels = selected_genes,
+  row_names_gp = gpar(fontsize = 8),
+  clustering_distance_columns = "manhattan",
+  clustering_distance_rows = "manhattan",
+  top_annotation = pchAnno,
+  bottom_annotation = cytokineAnno,
+  show_column_names = FALSE,
+  show_row_names = TRUE)
+
+print(hmap_z)
+
+
+pdf(file.path(plots_dir, "HeatmapKeratinocytesSelectedGenesRowZScoresCountsAveragesWithNoStim.pdf"),
+    height = 6,
+    width = 5)
+
+print(hmap_z)
+
+
+invisible(dev.off())
+
+```
+
+## Fibroblasts
+
+### Comparisons against all others
+
+In the following volcano plots and heatmaps, samples are grouped by type of stimulation and T-sort and compared against the average of all other samples (ie one group vs controls and other stims).
+
+```{r model_fibroblasts_one_stim_vs_av_others}
+#Differential gene expression in fibroblast samples
+
+designMatFib <- model.matrix(~0+designFib$stimSortChar)
+
+#simplify columns names so contrasts are easier to make later
+colnames(designMatFib) <- colnames(designMatFib) %>%
+  str_remove_all("designFib|stimSortChar") %>%
+  str_remove_all("\\$")
+
+vwtsFib <- voomWithQualityWeights(countsFib, design= designMatFib, plot=F, span=0.1)
+
+#Some samples are given smaller weights than others
+#It appears to be related to T cell donor
+# designFib$vwtsWeights <- vwtsFib$targets$sample.weights[match(designFib$libid,
+#                                                              rownames(vwtsFib$targets))]
+
+# ggplot(designFib,
+#        aes(x = libid,
+#            y = vwtsWeights,
+#            fill = stimSort))+
+#   geom_col()+
+#   scale_fill_manual(values = stimSortColors)
+# 
+# ggplot(designFib,
+#        aes(x = libid,
+#            y = vwtsWeights,
+#            fill = subjectID))+
+#   geom_col()+
+#   scale_fill_manual(values = subjectColors)
+
+
+# fit model
+vfitFib <-
+  lmFit(vwtsFib)
+
+vfitEbFib <- eBayes(vfitFib)
+
+
+nPops <- length(unique(designFib$stimSort))
+contrasts <- matrix(-1/(nPops-1), nPops, nPops) + diag(x=nPops/(nPops-1), nPops, nPops)
+colnames(contrasts) <- colnames(designMatFib)
+
+contFitFib <- contrasts.fit(vfitEbFib, contrasts)
+contFitFib <- eBayes(contFitFib)
+```
+
+```{r get_sig_genes_Fib}
+
+topGenesMediaVAllCD4sFib <- topTable(contFitFib, coef = "UnstimulatedControl", sort.by = "P", number = Inf)
+
+topGenesBloodCD4Th1VAllCD4sFib <- topTable(contFitFib, coef = "BloodCD4posCLAposTh1", sort.by = "P", number = Inf)
+
+topGenesBloodCD4Th2VAllCD4sFib <- topTable(contFitFib, coef = "BloodCD4posCLAposTh2", sort.by = "P", number = Inf)
+
+topGenesBloodCD4Th17VAllCD4sFib <- topTable(contFitFib, coef = "BloodCD4posCLAposTh17", sort.by = "P", number = Inf)
+
+topGenesBloodCD4Th22VAllCD4sFib <- topTable(contFitFib, coef = "BloodCD4posCLAposTh22", sort.by = "P", number = Inf)
+
+topGenesBloodCD4CD103posVAllCD4sFib <- topTable(contFitFib, coef = "BloodCD4posCLAposCD103pos", sort.by = "P", number = Inf)
+
+topGenesSkinCD4CD103negVAllCD4sFib <- topTable(contFitFib, coef = "SkinCD4posCLAposCD103neg", sort.by = "P", number = Inf)
+
+topGenesSkinCD4CD103posVAllCD4sFib <- topTable(contFitFib, coef = "SkinCD4posCLAposCD103pos", sort.by = "P", number = Inf)
+
+
+```
+
+### Volcano plots
+
+```{r volcano_plots_vs_others_fib}
+gBloodCD4Th1Fib <- plot_volcano(topGenesBloodCD4Th1VAllCD4sFib, 
+                          title = "Others vs Blood CD4+CLA+Th1",
+                          color_labels = c("Down in BloodCD4+CLA+Th1", "Up in BloodCD4+CLA+Th1"), 
+                          color_values = as.vector(stimSortColors[c("UnstimulatedControl", "BloodCD4+CLA+Th1")]),
+                          y_max = 23,  
+                          anno_type = "top20")
+
+gBloodCD4Th2Fib <- plot_volcano(topGenesBloodCD4Th2VAllCD4sFib, 
+                          title = "Others vs Blood CD4+CLA+Th2",
+                          color_labels = c("Down in BloodCD4+CLA+Th2", "Up in BloodCD4+CLA+Th2"), 
+                          color_values = as.vector(stimSortColors[c("UnstimulatedControl", "BloodCD4+CLA+Th2")]),
+                          y_max = 20,  
+                          anno_type = "top20")
+
+gBloodCD4Th17Fib <- plot_volcano(topGenesBloodCD4Th17VAllCD4sFib, 
+                          title = "Others vs Blood CD4+CLA+Th17",
+                          color_labels = c("Down in BloodCD4+CLA+Th17", "Up in BloodCD4+CLA+Th17"), 
+                          color_values = as.vector(stimSortColors[c("UnstimulatedControl", "BloodCD4+CLA+Th17")]),
+                          y_max = 23,  
+                          anno_type = "top20")
+
+gBloodCD4Th22Fib <- plot_volcano(topGenesBloodCD4Th22VAllCD4sFib, 
+                          title = "Others vs Blood CD4+CLA+Th22",
+                          color_labels = c("Down in BloodCD4+CLA+Th22", "Up in BloodCD4+CLA+Th22"), 
+                          color_values = as.vector(stimSortColors[c("UnstimulatedControl", "BloodCD4+CLA+Th22")]),
+                          y_max = 23,  
+                          anno_type = "top20")
+
+gBloodCD4CD103posFib <- plot_volcano(topGenesBloodCD4CD103posVAllCD4sFib, 
+                          title = "Others vs Blood CD4+CLA+CD103+",
+                          color_labels = c("Down in BloodCD4+CLA+CD103+", "Up in BloodCD4+CLA+CD103+"), 
+                          color_values = as.vector(stimSortColors[c("UnstimulatedControl", "BloodCD4+CLA+CD103+")]),
+                          y_max = 23,  
+                          anno_type = "top20")
+
+gSkinCD4CD103negFib <- plot_volcano(topGenesSkinCD4CD103negVAllCD4sFib, 
+                          title = "Others vs Skin CD4+CLA+CD103-",
+                          color_labels = c("Down in SkinCD4+CLA+CD103-", "Up in SkinCD4+CLA+CD103-"), 
+                          color_values = as.vector(stimSortColors[c("UnstimulatedControl", "SkinCD4+CLA+CD103-")]),
+                          y_max = 23,  
+                          anno_type = "top20")
+
+gSkinCD4CD103posFib <- plot_volcano(topGenesSkinCD4CD103posVAllCD4sFib, 
+                          title = "Others vs Skin CD4+CLA+CD103+",
+                          color_labels = c("Down in SkinCD4+CLA+CD103+", "Up in SkinCD4+CLA+CD103+"), 
+                          color_values = as.vector(stimSortColors[c("UnstimulatedControl", "SkinCD4+CLA+CD103+")]),
+                          y_max = 23,  
+                          anno_type = "top20")
+
+
+
+# ggpubr::ggarrange(gBloodCD4Th1,
+#                   gBloodCD4Th2,
+#                   gBloodCD4Th17,
+#                   gBloodCD4Th22,
+#                   gBloodCD4CD103pos,
+#                   gSkinCD4CD103neg,
+#                   gSkinCD4CD103pos,
+#                   ncol=2,
+#                   nrow=4,
+#                   common.legend = FALSE)
+
+pdf(file.path(plots_dir, "VolcanoPlotsFibroblasts.pdf"),
+    height = 15,
+    width=10)
+
+ggpubr::ggarrange(gBloodCD4CD103posFib + theme(legend.position = "none"),
+                  gBloodCD4Th1Fib + theme(legend.position = "none"),
+                  gBloodCD4Th2Fib + theme(legend.position = "none"),
+                  gBloodCD4Th17Fib + theme(legend.position = "none"),
+                  gBloodCD4Th22Fib + theme(legend.position = "none"),
+                  gSkinCD4CD103negFib + theme(legend.position = "none"),
+                  gSkinCD4CD103posFib + theme(legend.position = "none"),
+                  ncol=2,
+                  nrow=4,
+                  common.legend = FALSE)
+invisible(dev.off())
+
+png(file.path(plots_dir, "VolcanoPlotsFibroblasts.png"),
+    height = 2000,
+    width=1600)
+
+ggpubr::ggarrange(gBloodCD4CD103posFib,
+                  gBloodCD4Th1Fib,
+                  gBloodCD4Th2Fib,
+                  gBloodCD4Th17Fib,
+                  gBloodCD4Th22Fib,
+                  gSkinCD4CD103negFib,
+                  gSkinCD4CD103posFib,
+                  ncol=2,
+                  nrow=4,
+                  common.legend = FALSE)
+
+invisible(dev.off())
+```
+
+###Heatmap
+
+The following heatmap shows the top 20 differentially expressed genes (20 smallest p-values) for each group compared against other CD4 groups.
+
+```{r heatmap_stim_vs_all_cd4s_Fib, fig.width=7, fig.height=8, dependson="de_functions"}
+
+top20GenesUnion <- Reduce(union, list(get_top_n_genes(topGenesBloodCD4Th1VAllCD4sFib),
+                                      get_top_n_genes(topGenesBloodCD4Th2VAllCD4sFib),
+                                      get_top_n_genes(topGenesBloodCD4Th17VAllCD4sFib),
+                                      get_top_n_genes(topGenesBloodCD4Th22VAllCD4sFib),
+                                      get_top_n_genes(topGenesBloodCD4CD103posVAllCD4sFib),
+                                      get_top_n_genes(topGenesSkinCD4CD103negVAllCD4sFib),
+                                      get_top_n_genes(topGenesSkinCD4CD103posVAllCD4sFib)))
+
+designForHmap <- designFib %>%
+  dplyr::filter(stimSort != "UnstimulatedControl",
+                !is.na(IL4)) %>%
+  dplyr::arrange(stimSort) %>%
+  droplevels()
+
+cytokinesForHmap <- designForHmap[, cytokineCols]
+
+countsForHmap <- log2(countsFib[top20GenesUnion,designForHmap$libid]+1)
+
+columnAnno <- HeatmapAnnotation(Stimulation = designForHmap$stimSort,
+                                Source = designForHmap$stim,
+                              col = list(Stimulation = stimSortColors,
+                                         Source = stimColors)) 
+
+columnAnno <- HeatmapAnnotation(Stimulation = designForHmap$stimSort,
+                                Source = designForHmap$stim,
+                              col = list(Stimulation = stimSortColors,
+                                         Source = stimColors)) 
+
+#Set up annotation with different shapes for different stimulations
+pchKey <- data.frame(stimSort =  c("BloodCD4+CLA+CD103+", 
+                                   "BloodCD4+CLA+Th1" ,
+                                   "BloodCD4+CLA+Th17",
+                                   "BloodCD4+CLA+Th2" ,
+                                   "BloodCD4+CLA+Th22",
+                                   "SkinCD4+CLA+CD103-",
+                                   "SkinCD4+CLA+CD103+"),
+                     shape = c(15, 15, 15, 15, 15, 1, 1),
+                     color = c(stimSortColors[c("BloodCD4+CLA+CD103+", 
+                                   "BloodCD4+CLA+Th1" ,
+                                   "BloodCD4+CLA+Th17",
+                                   "BloodCD4+CLA+Th2" ,
+                                   "BloodCD4+CLA+Th22",
+                                   "SkinCD4+CLA+CD103-",
+                                   "SkinCD4+CLA+CD103+")]))
+
+pchSymbols <- pchKey$shape[match(designForHmap$stimSort,
+                             pchKey$stimSort)]
+
+pchColors <- pchKey$color[match(designForHmap$stimSort,
+                             pchKey$stimSort)]
+
+whiteStimColors <- rep("white",length(unique(designForHmap$stimSort)))
+names(whiteStimColors) <- levels(designForHmap$stimSort)
+
+pchAnno <- HeatmapAnnotation(Source = anno_simple(as.vector(designForHmap$stimSort), 
+                                                  col = whiteStimColors,
+                                                  pt_gp = gpar(col = pchColors),
+                                                  pch = pchSymbols))
+
+cytokineAnno <- getCytokineSubsetAnnotation(designForHmap) 
+ 
+scaledCounts <- t(scale(t(countsForHmap))) 
+
+centeredCounts <- t(scale(t(countsForHmap), scale = FALSE))
+
+hmap <- Heatmap(scaledCounts,
+        name = "row z-score",
+        #cluster_columns = FALSE,
+        #cluster_rows = FALSE,
+        #row_labels = selected_genes,
+        row_names_gp = gpar(fontsize = 8),
+        #clustering_distance_columns = "manhattan",
+        #clustering_distance_rows = "manhattan",
+        top_annotation = pchAnno,
+        bottom_annotation = cytokineAnno,
+        show_column_names = FALSE,
+        show_row_names = FALSE)
+
+draw(hmap)
+
+geneDend <- row_dend(hmap)
+
+pdf(file.path(plots_dir, "HeatmapFibroblastsStimVsAllCD4sTop20.pdf"),
+    height = 6,
+    width = 9)
+
+print(hmap)
+
+
+invisible(dev.off())
+
+```
+
+```{r heatmap_dan_selected_genes_fibroblasts}
+
+selGenes <- c("CCL2", "CIITA", "LTB", "CXCL11", "IDO1", "IL13RA2", "CCL26", "MMP7", "IL23A", "CSF3", "CXCL8", "IL17C", "TOP2A", "MKI67", "CDK1", "CDC20", "CENPA", "CENPF")
+
+selGenes <- selGenes[selGenes %in% rownames(countsFib)]
+
+designForHmap <- designFib %>%
+  dplyr::filter(stimSort != "UnstimulatedControl",
+                !is.na(IL4)) %>%
+  dplyr::arrange(stimSort) %>%
+  droplevels()
+
+countsForHmap <- countsFib[selGenes, designForHmap$libid]
+
+designEpiCountsFib <- merge(designForHmap, 
+                            t(countsForHmap),
+                            by.x="libid",
+                            by.y = "row.names")
+
+designAveraged <- designEpiCountsFib %>%
+  dplyr::group_by(stimSort) %>%
+  dplyr::summarise(across(c(cytokineCols, selGenes), ~ mean(.x))) %>%
+  droplevels() %>%
+  as.data.frame()
+
+countsAveraged <- designAveraged[, selGenes] %>% t()
+
+#Which genes are DE?
+
+sigGenesUnion <- Reduce(union, list(#get_sig_genes(topGenesMediaVAllCD4sFib),
+                                    get_sig_genes(topGenesBloodCD4Th1VAllCD4sFib),
+                                      get_sig_genes(topGenesBloodCD4Th2VAllCD4sFib),
+                                      get_sig_genes(topGenesBloodCD4Th17VAllCD4sFib),
+                                      get_sig_genes(topGenesBloodCD4Th22VAllCD4sFib),
+                                      get_sig_genes(topGenesBloodCD4CD103posVAllCD4sFib),
+                                      get_sig_genes(topGenesSkinCD4CD103negVAllCD4sFib),
+                                      get_sig_genes(topGenesSkinCD4CD103posVAllCD4sFib)))
+
+#Which genes are DE?
+deGeneStatus = ifelse(selGenes %in% sigGenesUnion, "DE", "notDE")
+whiteSigColors <- c("DE" = "white",
+                    "notDE" = "white")
+pchSig <- ifelse(selGenes %in% sigGenesUnion, "*", NA)
+
+sigAnno = rowAnnotation(    
+    Source = anno_simple(deGeneStatus, 
+                         col = whiteSigColors, 
+                         pch = pchSig)) 
+
+pchSymbols <- pchKey$shape[match(designAveraged$stimSort,
+                             pchKey$stimSort)]
+
+pchColors <- pchKey$color[match(designAveraged$stimSort,
+                             pchKey$stimSort)]
+
+whiteStimColors <- rep("white", length(unique(designAveraged$stimSort)))
+names(whiteStimColors) <- unique(designAveraged$stimSort)
+
+pchAnno = HeatmapAnnotation(    
+    Source = anno_simple(as.vector(designAveraged$stimSort), 
+                         col = whiteStimColors, 
+                         pch = pchSymbols,
+                         pt_gp = gpar(col = pchColors))) 
+
+
+cytokinesForHmap <- designAveraged[, cytokineCols]
+
+cytokineAnno <- getCytokineSubsetAnnotation(designAveraged) 
+ 
+scaledCounts <- t(scale(t(countsAveraged))) 
+
+centeredCounts <- t(scale(t(countsAveraged), scale = FALSE))
+
+hmap_z <- Heatmap(#countsAveraged,
+  scaledCounts,
+  #countsForHmap,
+  #col = epiColFun,
+  #name = "Log2 counts",
+  name = "Row z-score",
+  #cluster_columns = FALSE,
+  #cluster_rows = FALSE,
+  #row_labels = selected_genes,
+  row_names_gp = gpar(fontsize = 8),
+  clustering_distance_columns = "manhattan",
+  clustering_distance_rows = "manhattan",
+  top_annotation = pchAnno,
+  bottom_annotation = cytokineAnno,
+  show_column_names = FALSE,
+  show_row_names = TRUE)
+
+print(hmap_z)
+
+
+pdf(file.path(plots_dir, "HeatmapFibroblastsSelectedGenesRowZScoresCountsAveragesWithNoStim.pdf"),
+    height = 6,
+    width = 5)
+
+print(hmap_z)
+
+
+invisible(dev.off())
+
+```
+
+# Enrichment
+
+```{r make_enrichment_plot}
+
+stimSortColorsEnrichmentNames <- stimSortColors
+names(stimSortColorsEnrichmentNames) <- c("Unstimulated",
+                           "Blood CD4+ CD103+",
+                           "Blood CD4+ Th1",
+                           "Blood CD4+ Th17",
+                           "Blood CD4+ Th2",
+                           "Blood CD4+ Th22",
+                           "Skin CD4+ CD103-",
+                           "Skin CD4+ CD103+")
+stimSortShapes <- c("Unstimulated" = 17,
+                    "Blood CD4+ CD103+" = 15,
+                    "Blood CD4+ Th1" = 15,
+                    "Blood CD4+ Th17" = 15,
+                    "Blood CD4+ Th2" = 15,
+                    "Blood CD4+ Th22" = 15,
+                    "Skin CD4+ CD103-" = 1,
+                    "Skin CD4+ CD103+" = 1)
+
+enrichedDotPlot <- function(enrichedDF,
+                            plotName,
+                            fracCutoff = 0.10,
+                            pCutoff = 1e-6,
+                            nTerms = 10,
+                            figureHeight = 6,
+                            figureWidth = 8){
+  
+  #Remove numbers from term names
+  enrichedDF <- enrichedDF %>%
+    dplyr::mutate(Term = str_remove(Term, " R\\-HSA\\-[0-9]+")) 
+  
+  #Subset to pathways that are > fracCutoff or pCutoff for at least one set of conditions and take at most the top 10 terms from a condition
+enrichedPathways <- enrichedDF  %>% 
+  dplyr::filter(frac > fracCutoff ) %>%
+   dplyr::filter(`P.value` < pCutoff) %>%
+  dplyr::group_by(comparison) %>%
+  dplyr::slice_min(`P.value`, n = nTerms)
+
+ enrichedDF <- enrichedDF  %>% 
+  dplyr::filter(Term %in% enrichedPathways$Term) %>% 
+   dplyr::select(Term, comparison, frac, `P.value`) %>%
+  tidyr::complete(Term, comparison, fill = list(frac = 0, `P.value` = 1)) 
+ 
+ mat <- enrichedDF %>% 
+  dplyr::select(frac, comparison, Term) %>%  # drop unused columns to facilitate widening
+  dplyr::filter(Term %in% enrichedPathways$Term) %>% 
+  pivot_wider(id_cols = Term,
+              names_from = comparison, 
+              values_from = frac,
+              values_fill = 0) %>% 
+  data.frame() # make df as tibbles -> matrix annoying
+row.names(mat) <- mat$Term  # put gene in `row`
+mat <- mat[,-1] #drop gene column as now in rows
+clust <- hclust(dist(mat %>% as.matrix()))
+
+ddgram <- as.dendrogram(clust) # create dendrogram
+ggtree_plot <- ggtree::ggtree(ddgram)
+ggtree_plot
+ 
+gEnrichmentPlot <- enrichedDF %>%
+   dplyr::mutate(Term = factor(Term, levels = clust$labels[clust$order])) %>%
+   ggplot(aes(x = -log10(`P.value`), 
+              y = Term, 
+              color = comparison, 
+              shape = comparison)) +
+  #Add jitter to y axis to separate points
+  geom_point(position = position_jitterdodge(jitter.width = 0.1, dodge.width = 0.5),
+             size = 2) +
+   #geom_point(size = 4) +
+   scale_color_manual(values = stimSortColorsEnrichmentNames)+
+   scale_shape_manual(values = stimSortShapes) +
+  scale_y_discrete(position = "right") +
+   labs(x = "-log10 adj P",
+        y = "",
+        color = "",
+        shape = "") +
+   theme(text = element_text(size=12),
+         panel.grid.major.y = element_line()) +
+   guides(color = "none",
+          shape = "none") 
+
+
+pdf(file.path(plots_dir, plotName),
+    height = figureHeight,
+    width = figureWidth)
+print(cowplot::plot_grid(ggtree_plot, gEnrichmentPlot, nrow = 1, rel_widths = c(0.25,2), align = 'h'))
+
+invisible(dev.off())
+
+return(gEnrichmentPlot)
+
+}
+
+
+```
+
+## Enrichment in keratinocytes
+
+```{r enrichr_keratinocytes} 
+
+library(enrichR)
+setEnrichrSite("Enrichr") # Human genes
+
+dbs <- listEnrichrDbs()
+#Category 2 are pathways databases
+
+dbs <- dbs %>%
+  dplyr::filter(categoryId == 2)
+
+#Add database name to each list item before turning into a df
+
+getEnrichment <- function(geneList,
+                          dbsInput){
+  
+  enriched <-  enrichr(geneList, dbsInput)
+  
+  enriched <- enriched[sapply(enriched, nrow)>0]
+  enriched <- bind_rows(enriched, .id = "database")
+  #Hack to get plot function to show FDR
+  enriched$origPValue <- enriched$P.value
+  enriched$P.value <- p.adjust(enriched$P.value, 
+                           method = "fdr")
+  
+  enriched$Old.P.value <- NULL
+  enriched$Old.Adjusted.P.value <- NULL
+  
+  enriched$nGenes <- str_extract(enriched$Overlap, "[0-9]+") %>% 
+    as.numeric()
+  enriched$nSet <- str_extract(enriched$Overlap, "[0-9]+$") %>% 
+    as.numeric()
+  enriched$frac <- enriched$nGenes/enriched$nSet
+  
+  enriched <- enriched %>%
+    dplyr::arrange(origPValue)
+  
+  
+  return(enriched)
+}
+
+
+databases <- dbs$libraryName
+
+topTablesKer <- list("Blood CD4+ Th1" = topGenesBloodCD4Th1VAllCD4sKer,
+                    "Blood CD4+ Th2" = topGenesBloodCD4Th2VAllCD4sKer,
+                    "Blood CD4+ Th17" = topGenesBloodCD4Th17VAllCD4sKer,
+                    "Blood CD4+ Th22" = topGenesBloodCD4Th22VAllCD4sKer,
+                    "Blood CD4+ CD103+" = topGenesBloodCD4CD103posVAllCD4sKer,
+                    "Skin CD4+ CD103-" = topGenesSkinCD4CD103negVAllCD4sKer,
+                    "Skin CD4+ CD103+" = topGenesSkinCD4CD103posVAllCD4sKer)
+
+get_sig_genes_up <- function(top_genes,
+                          lfc_cutoff = 1,
+                          fdr_cutoff = 0.05){
+  
+  top_genes$gene <- rownames(top_genes)
+  
+  sig_table <- top_genes %>%
+    dplyr::filter(logFC > lfc_cutoff,
+                  adj.P.Val < fdr_cutoff)
+  
+  sig_genes <- sig_table$gene
+  return(sig_genes)
+
+}
+
+KerDEGeneList <- lapply(topTablesKer, get_sig_genes_up)
+
+selectedDatabases <- c("Reactome_2022")
+
+enrichedSupKerVAllCD4s <- lapply(KerDEGeneList,
+                                 function(x) getEnrichment(x, selectedDatabases))
+
+
+flattenList <- function(listIn){
+  
+  for(i in 1:length(listIn)){
+    listIn[[i]]$comparison <- names(listIn)[[i]]
+  }
+  
+  flattened <- as.data.frame(do.call(rbind, listIn))
+  
+  flattened <- flattened %>%
+    dplyr::filter(database %in% selectedDatabases)
+  
+  return(flattened)
+  
+}
+
+enrichedSupKerVAllCD4s <- flattenList(enrichedSupKerVAllCD4s)
+
+enrichedDotPlot(enrichedSupKerVAllCD4s,
+                "enrichmentPValuePlot_SupKer.pdf",
+                figureHeight = 6,
+                figureWidth = 10)
+
+```
+
+## Enrichment in fibroblasts
+
+
+```{r enrichment_fib}
+
+setEnrichrSite("Enrichr") # Human genes
+
+dbs <- listEnrichrDbs()
+#Category 2 are pathways databases
+
+dbs <- dbs %>%
+  dplyr::filter(categoryId == 2)
+
+databases <- dbs$libraryName
+
+topTablesFib <- list("Blood CD4+ Th1" = topGenesBloodCD4Th1VAllCD4sFib,
+                    "Blood CD4+ Th2" = topGenesBloodCD4Th2VAllCD4sFib,
+                    "Blood CD4+ Th17" = topGenesBloodCD4Th17VAllCD4sFib,
+                    "Blood CD4+ Th22" = topGenesBloodCD4Th22VAllCD4sFib,
+                    "Blood CD4+ CD103+" = topGenesBloodCD4CD103posVAllCD4sFib,
+                    "Skin CD4+ CD103-" = topGenesSkinCD4CD103negVAllCD4sFib,
+                    "Skin CD4+ CD103+" = topGenesSkinCD4CD103posVAllCD4sFib)
+
+fibDEGeneList <- lapply(topTablesFib, get_sig_genes_up)
+
+selectedDatabases <- c("GO_Biological_Process_2023",
+               "MSigDB_Hallmark_2020",
+               "KEGG_2021_Human",
+               "Reactome_2022")
+
+selectedDatabases <- c("Reactome_2022")
+
+enrichedSupFibVAllCD4s <- lapply(fibDEGeneList,
+                                 function(x) getEnrichment(x, selectedDatabases))
+
+
+enrichedSupFibVAllCD4s <- flattenList(enrichedSupFibVAllCD4s)
+
+enrichedDotPlot(enrichedSupFibVAllCD4s,
+                "enrichmentPValuePlot_SupFib.pdf",
+                figureHeight = 4,
+                figureWidth = 6)
+
+
+```
+
+```{r count_donors_per_group}
+
+designQC %>%
+  dplyr::group_by(stimSort) %>%
+  dplyr::summarise(nDonors = length(unique(subjectID))) 
+
+design %>%
+  dplyr::group_by(stimSort) %>%
+  dplyr::summarise(nDonors = length(unique(subjectID))) 
+
+```

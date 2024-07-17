@@ -1,0 +1,1858 @@
+---
+title: "AD RNAseq analysis"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    number_sections: true
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, echo=FALSE, message=FALSE, warning=FALSE}
+library(knitr)
+library(readxl)
+library(dplyr)
+library(stringr)
+#library(affy)
+library(limma)
+library(ggplot2); theme_set(
+  theme_bw(20) +
+    theme(panel.grid.major = element_blank(),
+          panel.grid.minor = element_blank(),
+          panel.border = element_rect(colour="black", fill=NA, size=1),
+          axis.text=element_text(colour="black"),
+          axis.ticks=element_line(colour="black"),
+          legend.key = element_blank(),
+          text = element_text(size=20),
+          strip.text.x = element_text(size = 10,margin = margin( b = 2, t = 2) ),
+            strip.background = element_rect(fill="white", colour="black")))
+library(kableExtra)
+library(plotly)
+library(randomcoloR)
+library(ggrepel)
+library(ggbeeswarm)
+library(ComplexHeatmap)
+library(umap)
+library(GEOquery)
+library(forcats)
+library(tidyr)
+library(edgeR)
+
+opts_chunk$set(fig.width=6, fig.height=4.0, cache = TRUE, echo=FALSE, warning=FALSE, message=FALSE, results='hide')
+opts_knit$set(root.dir = "/Users/hdeberg/Box/P253_PeterM_Campbell_Keratinocytes_Fibroblasts")
+
+options(stringsAsFactors = FALSE)
+```
+
+```{r set_up_directories}
+
+baseDir <- "/Users/hdeberg/Box/P253_PeterM_Campbell_Keratinocytes_Fibroblasts"
+dataDir <- file.path(baseDir, "data")
+geoDataDir <- file.path(baseDir, "data", "GEODatasets")
+plotsDir <- file.path(baseDir, "plots")
+tablesDir <- file.path(baseDir, "tables")
+
+```
+
+```{r set_colors_shapes}
+
+regionColors <- RColorBrewer::brewer.pal(4, "Set1")
+names(regionColors) <- c("healthy",
+                         "non_lesional",
+                         "lesional",
+                         "chronic_lesion")
+
+therapyColors <- c("none" = "darkcyan",
+                   "cyclosporine" = "orange",
+                   "dupilumab" = "red")
+  
+visitShapes <- c(1,16)
+
+therapyShapes <- c(1,15,17)
+
+
+```
+
+```{r get_metadata}
+
+Sys.setenv("VROOM_CONNECTION_SIZE" = 131072 * 8)
+
+gdsGSE157194 <- getGEO("GSE157194")
+GSE157194Anno <- gdsGSE157194$GSE157194_series_matrix.txt.gz@phenoData@data
+
+gdsGSE121212 <- getGEO("GSE121212")
+GSE121212Anno <- gdsGSE121212$GSE121212_series_matrix.txt.gz@phenoData@data
+
+anno <- GSE157194Anno %>%
+  dplyr::mutate(donorID = str_remove(characteristics_ch1, "patient id: "),
+                disease = "AD",
+                visit = case_when(characteristics_ch1.2 == "timepoint: baseline (m0)" ~ "M0",
+                                  characteristics_ch1.2 == "timepoint: 3 months post-treatment (m3)" ~ "M3"),
+                therapy = case_when(`therapy:ch1` == "cyclosporine" ~ "cyclosporine",
+                                    `therapy:ch1` == "dupilumab" ~ "dupilumab",
+                                    is.na(`therapy:ch1`) ~ "none"),
+                skinRegion = str_extract(title, "AN|AL"),
+                region = case_when(skinRegion == "AN" ~ "non_lesional",
+                                   skinRegion == "AL" ~ "lesional"),
+                region = factor(region, levels = c("non_lesional",
+                                                   "lesional")),
+                therapy = factor(therapy, levels = c("none",
+                                                     "cyclosporine",
+                                                     "dupilumab")),
+                dataset = "GSE157194")
+
+
+anno2 <- GSE121212Anno %>%
+  dplyr::mutate(donorID = paste0("GSE121212Donor_", str_extract(title, "[0-9]{3}")),
+                disease = `patient's condition:ch1`,
+                therapy = "none",
+                skinRegion = str_extract(title, "AN|AL"),
+                region = `skin type:ch1`,
+                region = str_replace(region, "-", "_"),
+                dataset = "GSE121212",
+                title = str_replace_all(title, "-", "_"))
+
+annoComb <- bind_rows(anno, anno2)
+
+annoComb <- annoComb %>%
+  dplyr::mutate(region = factor(region, levels = c("healthy",
+                                                   "non_lesional",
+                                                   "lesional",
+                                                   "chronic_lesion")),
+                disease = factor(disease, levels = c("CTRL",
+                                                     "AD",
+                                                     "PSO")),
+                therapy = factor(therapy, levels = c("none",
+                                                     "cyclosporine",
+                                                     "dupilumab")),
+                regionTherapy = paste(region, therapy, sep = "_"),
+                regionTherapy = factor(regionTherapy,
+                                    levels = c("healthy_none",
+                                               "non_lesional_cyclosporine",
+                                               "non_lesional_dupilumab",
+                                               "non_lesional_none",
+                                               "lesional_cyclosporine",
+                                               "lesional_dupilumab",
+                                               "lesional_none",
+                                               "chronic_lesion_none")))
+
+#Remove psoriasis 
+annoComb <- annoComb %>% 
+  dplyr::filter(disease != "PSO")
+
+#Remove cyclosporine treated
+
+annoComb <- annoComb %>%
+  dplyr::filter(therapy != "cyclosporine")
+
+#Remove the very few chronic lesional samples
+
+annoComb <- annoComb %>%
+  dplyr::filter(regionTherapy != "chronic_lesion_none")
+
+save(annoComb,
+     file = file.path(geoDataDir, "GSE157194_GSE121212_Anno.RData"))
+
+
+```
+
+```{r counts}
+#Read in counts
+
+countsGSE157194 <- read.table(file = file.path(geoDataDir, "GSE157194_Raw_gene_counts_matrix.txt"),
+                     header = TRUE)
+
+rownames(countsGSE157194) <- countsGSE157194$Gene
+countsGSE157194$Gene <- NULL
+
+countsGSE157194 <- countsGSE157194[,anno$title]
+
+
+countsGSE121212 <- read.table(file = file.path(geoDataDir, "GSE121212_readcount.txt"),
+                     header = TRUE,
+                     row.names = NULL)
+
+countsGSE121212 <- dplyr::rename(countsGSE121212, "gene"= "row.names")
+
+countsGSE121212 <-  data.table::as.data.table(countsGSE121212) 
+
+countsGSE121212 <-  countsGSE121212[,lapply(.SD,median),"gene"] %>%
+  as.data.frame() %>%
+    magrittr::set_rownames(., value=.$gene)
+
+countsGSE121212$gene <- NULL
+
+colnames(countsGSE121212) <- str_replace_all(colnames(countsGSE121212),
+                                             fixed("."),
+                                             "_")
+
+#Filter psoriasis samples
+countsGSE121212 <- countsGSE121212[,colnames(countsGSE121212) %in% annoComb$title]
+
+```
+
+```{r gene_filtering}
+## Keep protein coding genes with HGNC symbols, and drop non-protein-coding genes
+library(data.table)
+## Keep protein coding genes with HGNC symbols, and drop non-protein-coding genes
+v38 <- annotables::grch38
+pc38 <- v38[v38$biotype == "protein_coding",] # grab protein coding
+pcWithNoSymbol <- pc38[pc38$symbol == "",] # protein coding that have no symbol
+pcWithSymbol <- pc38[pc38$symbol != "",] # get the protein coding entries that have symbols
+
+countsGSE157194WithSymbol <- countsGSE157194[rownames(countsGSE157194) %in% pcWithSymbol$ensgene,] # make a counts matrix that is protein coding and has symbols
+
+countsGSE157194WithSymbol$gene <- pcWithSymbol$symbol[match(rownames(countsGSE157194WithSymbol),
+                                                            pcWithSymbol$ensgene)] 
+
+## use data.table to aggregate/sum counts for duplicated HGNC symbols (way faster than stats::aggregate)
+
+# this also drops rows with HGNC.symbols==NA, which should include any non-protein-coding genes
+
+
+countsPCGSE157194 <- countsGSE157194WithSymbol %>%
+  dplyr::group_by(gene) %>%
+  dplyr::summarise(across(starts_with("Patient"), sum)) %>%
+  arrange(gene) %>%
+    dplyr::filter(gene != "MTRNR2L1") %>% # exclude MTRNR2L1
+    as.data.frame() %>%
+    magrittr::set_rownames(., value=.$gene)
+
+countsPCGSE157194 <- countsPCGSE157194[, -which(colnames(countsPCGSE157194) == "gene")]
+
+# dim(countsPCGSE157194)
+# 18895 genes, 166 libraries
+
+#Overlap two counts matrices
+geneIntersection <- intersect(rownames(countsGSE121212),
+                      rownames(countsPCGSE157194))
+# length(geneIntersection) #16408
+
+countsGSE121212Overlap <- countsGSE121212[geneIntersection,]
+countsGSE157194Overlap <- countsPCGSE157194[geneIntersection,]
+
+##Check
+#sum(rownames(countsGSE121212Overlap) != rownames(countsGSE157194Overlap))
+
+countsComb <- cbind(countsGSE157194Overlap,
+                    countsGSE121212Overlap)
+
+countsComb <- countsComb[, annoComb$title]
+
+##Check
+# dim(countsComb)
+# [1] 16408   313
+## filter lowly expressed genes
+
+#Define a function to filter out lowly expressed genes
+gene_filter <- function(counts_in, 
+                        per_cutoff = 0.1,
+                        counts_cutoff = 1){
+  #Keep genes with cpm of at least counts_cutoff in at least per_cutoff fraction of libraries
+  #CPM normalize
+  counts_cpm_norm <- as.data.frame(t(t(counts_in*10^6)/colSums(counts_in)))
+  
+  #Filter out lowly expressed genes
+  keepRows <- rowSums((counts_cpm_norm) >= counts_cutoff) >= per_cutoff*ncol(counts_cpm_norm)
+  counts_filtered <- counts_in[keepRows,]
+  
+  return(counts_filtered)
+  
+}
+
+#Run function to filter lowly expressed genes
+#counts_all_filtered <- gene_filter(counts_hgnc, 0.10) #all genes with HGNC symbols
+countsPCFiltered <- gene_filter(countsComb, 0.10, 1)
+
+normalize_counts <- function(counts_in, method){
+  #normalize using tmm or deconvolution
+  #tmm is good for bulk RNAseq
+  #deconvolution is best for large datasets of single cell RNAseq
+  #deconvolution is NOT recommended for smaller datasets (less than a few hundred cells)
+  
+  if(method == "decon"){
+  #Normalize using the deconvolution algorithm
+  decon_norm_factors <- computeSumFactors(as.matrix(counts_in))
+  counts_norm <- as.data.frame(t(t(counts_in)/decon_norm_factors))
+  }
+  
+  if(method == "tmm"){
+  #Normalize using the TMM algorithm 
+  dge <- DGEList(counts_in)
+  dge <- calcNormFactors(dge)
+  counts_norm <- cpm(dge, normalized.lib.sizes=TRUE)
+  }
+  
+  return(counts_norm)
+  
+}
+
+countsPCNorm <- normalize_counts(countsPCFiltered, "tmm")
+#counts_all_norm <- normalize_counts(counts_all_filtered, "tmm")
+
+countsPCNorm <- countsPCNorm[,annoComb$title]
+
+```
+
+#Gene Filtering
+
+A filter is applied to select protein coding genes with HGNC symbols. Genes with very low very low expression across all libraries are removed as these genes will not be informative in downstream analysis. This filter selects genes with a count of at least one per million reads in 10% of libraries. This results `r nrow(countsPCNorm)` genes. The filtered genes are normalized using the TMM (trimmed mean of M values) algorithm.
+
+#Principal component analysis
+
+```{r pca}
+pca = prcomp(t(log2(countsPCNorm+1)), center=TRUE, scale=FALSE)
+
+#Get PCA resutls and merge with sample information stored in metrics
+sumPca = summary(pca)
+pcaScores = as.data.frame(pca$x)
+
+pdatscores <- merge(annoComb, pcaScores, by.x = "title", by.y="row.names")
+pc1Lab = paste("PC1 (", round(100*sumPca$importance[2, 1], 1),  "%)", sep="")
+pc2Lab = paste("PC2 (", round(100*sumPca$importance[2, 2], 1),  "%)", sep="")
+pc3Lab = paste("PC3 (", round(100*sumPca$importance[2, 3], 1),  "%)", sep="")
+pc4Lab = paste("PC4 (", round(100*sumPca$importance[2, 4], 1),  "%)", sep="")
+pc5Lab = paste("PC5 (", round(100*sumPca$importance[2, 5], 1),  "%)", sep="")
+pc6Lab = paste("PC6 (", round(100*sumPca$importance[2, 6], 1),  "%)", sep="")
+
+```
+
+#PC1 vs PC2
+
+```{r pc1_pc2}
+
+plotLayers <- list(labs(x = pc1Lab, 
+                        y = pc2Lab),
+                    theme(aspect.ratio = 1))  
+
+
+gPCAVisit <- ggplot() + 
+  geom_point(data = pdatscores, 
+             aes(x=PC1, 
+                 y=PC2, 
+                 color = visit)) +
+  
+  plotLayers
+
+gPCATherapy <- ggplot() + 
+  geom_point(data = pdatscores, 
+             aes(x=PC1, 
+                 y=PC2, 
+                 color = therapy)) +
+  
+  plotLayers
+
+gPCARegion <- ggplot() + 
+  geom_point(data = pdatscores, 
+             aes(x=PC1, 
+                 y=PC2, 
+                 color = region)) +
+  
+  plotLayers
+
+gPCA <- ggplot() + 
+  geom_point(data = pdatscores, 
+             aes(x=PC1, 
+                 y=PC2, 
+                 color = region,
+                 shape = dataset)) +
+  scale_shape_manual(values = c(1,16),
+                     name = "Dataset") +
+  scale_color_manual(values = regionColors,
+                     name = "Skin region") +
+  plotLayers
+
+print(gPCA)
+
+pdf(file.path(plotsDir, "PCA_AD_GSE157194_GSE121212.pdf"),
+    height = 4,
+    width = 6)
+
+print(gPCA)
+invisible(dev.off())
+
+```
+
+
+```{r combat}
+
+library(sva)
+annoComb$diseaseRegion <- paste(annoComb$disease, 
+                                annoComb$region,
+                                sep = "_")
+
+modelMat = model.matrix(~diseaseRegion, data=annoComb)
+batchCorCounts <- ComBat(log2(countsPCNorm+1),
+                      batch = annoComb$dataset,
+                      mod = modelMat)
+
+
+```
+
+#Principal component analysis after batch correction
+
+```{r pca}
+pca = prcomp(t(batchCorCounts), center=TRUE, scale=FALSE)
+
+#Get PCA resutls and merge with sample information stored in metrics
+sumPca = summary(pca)
+pcaScores = as.data.frame(pca$x)
+
+pdatscores <- merge(annoComb, pcaScores, by.x = "title", by.y="row.names")
+pc1Lab = paste("PC1 (", round(100*sumPca$importance[2, 1], 1),  "%)", sep="")
+pc2Lab = paste("PC2 (", round(100*sumPca$importance[2, 2], 1),  "%)", sep="")
+pc3Lab = paste("PC3 (", round(100*sumPca$importance[2, 3], 1),  "%)", sep="")
+pc4Lab = paste("PC4 (", round(100*sumPca$importance[2, 4], 1),  "%)", sep="")
+pc5Lab = paste("PC5 (", round(100*sumPca$importance[2, 5], 1),  "%)", sep="")
+pc6Lab = paste("PC6 (", round(100*sumPca$importance[2, 6], 1),  "%)", sep="")
+
+```
+
+#PC1 vs PC2
+
+#PC1 vs PC2
+
+```{r pc1_pc2_batch_cor}
+
+plotLayers <- list(labs(x = pc1Lab, 
+                        y = pc2Lab),
+                    theme(aspect.ratio = 1))  
+
+
+gPCAVisit <- ggplot() + 
+  geom_point(data = pdatscores, 
+             aes(x=PC1, 
+                 y=PC2, 
+                 color = visit)) +
+  
+  plotLayers
+
+gPCATherapy <- ggplot() + 
+  geom_point(data = pdatscores, 
+             aes(x=PC1, 
+                 y=PC2, 
+                 color = therapy)) +
+  
+  plotLayers
+
+gPCARegion <- ggplot() + 
+  geom_point(data = pdatscores, 
+             aes(x=PC1, 
+                 y=PC2, 
+                 color = region)) +
+  
+  plotLayers
+
+gPCA <- ggplot() + 
+  geom_point(data = pdatscores, 
+             aes(x=PC1, 
+                 y=PC2, 
+                 color = region,
+                 shape = dataset)) +
+  scale_shape_manual(values = c(1,16),
+                     name = "Dataset") +
+  scale_color_manual(values = regionColors,
+                     name = "Skin region") +
+  plotLayers
+
+print(gPCA)
+
+# pdf(file.path(plotsDir, "PCA_AD_AfterBatchCorrection.pdf"),
+#     height = 4,
+#     width = 6)
+# 
+# print(gPCA)
+# invisible(dev.off())
+
+#Color by region and therapy
+
+
+regionTherapyColors <- c("healthy_none" = "black",
+                         "non_lesional_dupilumab" = "blue",
+                         "non_lesional_none" = "darkcyan",
+                         "lesional_dupilumab" = "orange",
+                         "lesional_none" = "red")
+
+regionTherapyLabels <- c("healthy_none" = "HC",
+                         "lesional_none" = "AD_Lesional",
+                         "lesional_dupilumab" = "AD_Lesional_Dupi",
+                         "non_lesional_none" = "AD_NonLesional",
+                         "non_lesional_dupilumab" = "AD_NonLesional_Dupi")
+                         
+gPCA <- ggplot() + 
+  geom_point(data = pdatscores, 
+             aes(x=PC1, 
+                 y=PC2, 
+                 color = regionTherapy,
+                 shape = therapy)) +
+  scale_shape_manual(values = c(16,15)) +
+  scale_color_manual(values = regionTherapyColors,
+                     labels = regionTherapyLabels,
+                     name = "") +
+  plotLayers +
+  guides(shape = "none")
+
+
+pdf(file.path(plotsDir, "PCA_AD_BatchCorrected.pdf"),
+    height = 5,
+    width = 8)
+
+print(gPCA)
+invisible(dev.off())
+
+```
+
+# Plots of gene set scores 
+
+```{r open_gene_sets}
+
+read_all_sheets = function(xlsxFile, ...) {
+  sheet_names = openxlsx::getSheetNames(xlsxFile)
+  sheet_list = as.list(rep(NA, length(sheet_names)))
+  names(sheet_list) = sheet_names
+  for (sn in sheet_names) {
+    sheet_list[[sn]] = openxlsx::read.xlsx(xlsxFile, sheet=sn, colNames = FALSE,...)
+  }
+  return(sheet_list)
+}
+
+
+supKCGeneSets <- read_all_sheets(file.path(tablesDir, "SupStimulatedKCGeneSets.xlsx"))
+cytokineKCGeneSets <- read_all_sheets(file.path(tablesDir, "CytokineStimulatedKCGeneSets.xlsx"))
+
+#Filter to cytokine gene sets of interest at 24 hours
+
+cytokineKCGeneSets <- cytokineKCGeneSets[c("IFNG_24hr",
+                        "IL13_24hr",
+                        "IL17A_24hr",
+                        "IL22_24hr",
+                        "IL26_24hr")]
+
+names(cytokineKCGeneSets) <- str_remove(names(cytokineKCGeneSets), "_24hr")
+
+```
+
+```{r gene_set_heatmap}
+
+geneSetHeatmapScores <- function(geneSetObj,
+                           countsObj){
+  
+  # roastObj$geneSet <- rownames(roastObj)
+  # 
+  # roastObj <- roastObj %>%
+  #   dplyr::mutate(propSigned = case_when(Direction == "Up" ~ PropUp,
+  #                                        Direction == "Down" ~ -1*PropDown)) %>%
+  #   dplyr::arrange(FDR) %>%
+  #   dplyr::mutate(geneSet = factor(geneSet),
+  #                 geneSet = fct_reorder(geneSet,
+  #                                       FDR))
+  
+  selectedGeneSets <- names(geneSetObj)
+  selectedGenes <- geneSetObj[selectedGeneSets] 
+  
+  #Get the mean gene set score for all libs 
+  
+  scoreMatrix <- matrix(data=NA, 
+                        nrow=length(selectedGeneSets), 
+                        ncol=ncol(countsObj))
+  
+  for(i in 1:length(selectedGeneSets)){
+    
+      setGenes <- geneSetObj[[selectedGeneSets[i]]]
+      setGenes <- setGenes[!is.na(setGenes)]
+      setGenes <- setGenes[setGenes != ""]
+      setGenes <- setGenes[setGenes %in% rownames(countsObj)]
+        
+      countsObjSubset <- countsObj[setGenes,]
+    
+      setScores <- apply(countsObjSubset, 2, function(x) mean(x))
+      
+      scoreMatrix[i,] <- t(setScores)
+    
+  }
+  
+  rownames(scoreMatrix) <- selectedGeneSets
+  colnames(scoreMatrix) <- colnames(countsObj)
+    
+  return(scoreMatrix)
+}
+```
+
+```{r get_scores}
+
+scoresSupKC <- geneSetHeatmapScores(supKCGeneSets,
+                     batchCorCounts) %>% t() %>% as.data.frame()
+
+scoresSupKC$title <- rownames(scoresSupKC)
+
+scoresCytokineKC <- geneSetHeatmapScores(cytokineKCGeneSets,
+                     batchCorCounts) %>% t() %>% as.data.frame()
+
+scoresCytokineKC$title <- rownames(scoresCytokineKC)
+
+annoSupScores <- left_join(annoComb,
+                           scoresSupKC)
+
+annoCytokineScores <- left_join(annoComb,
+                           scoresCytokineKC)
+
+```
+
+```{r points_all}
+pd <- position_dodge(0.1)
+
+supVisitData <- annoSupScores %>%
+  # dplyr::filter(therapy != "cyclosporine",
+  #               region != "chronic_lesion") %>%
+  droplevels() %>%
+   dplyr::mutate(regionTherapy = case_when(regionTherapy == "healthy_none" ~ "HC",
+                                           regionTherapy == "non_lesional_dupilumab" ~ "AD/NL, Dupi",
+                                         regionTherapy == "non_lesional_none" ~ "AD/NL",
+                                         regionTherapy == "lesional_dupilumab" ~ "AD/L, Dupi",
+                                         regionTherapy == "lesional_none" ~ "AD/L")) %>%
+  pivot_longer(cols =  c("Blood CD4+ Th1",
+                        "Blood CD4+ Th2",
+                        "Blood CD4+ Th17",
+                        "Blood CD4+ Th22",
+                        "Blood CD4+ CD103+"),
+               names_to = "sup",
+               values_to = "score") %>%
+  dplyr::mutate(regionTherapy = factor(regionTherapy,
+                                    levels = c("HC",
+                                               "AD/L",
+                                               "AD/L, Dupi",
+                                               "AD/NL",
+                                               "AD/NL, Dupi")),
+                donorRegion = paste0(donorID, region)) 
+
+
+gSupVisits <- supVisitData %>%
+  ggplot(aes(x = regionTherapy,
+             y = score,
+             group = donorRegion)) +
+  #geom_boxplot(outlier.shape = NA) +
+  geom_point(position = pd) +
+   geom_line(position = pd) +
+   #ylim(c(6,8))+
+  labs(x = "",
+       y = "Gene set score") +
+   theme(axis.text.x=element_text(angle=60, hjust=1),
+         axis.text=element_text(size=10),
+            axis.title=element_text(size=10)) +
+  facet_wrap(~sup)
+
+pdf(file.path(plotsDir, 
+              "DotPlot_SupKCGeneSetScoresInADGroups.pdf"),
+    height = 5,
+    width = 6)
+
+print(gSupVisits)
+
+invisible(dev.off())
+
+regionTherapyColorsRevLabs <- c("HC" = "black",
+                                    "AD/L" = "red",
+                                "AD/L, Dupi" = "orange",
+                                 "AD/NL" = "darkcyan",
+                         "AD/NL, Dupi" = "blue")
+
+gSupVisits <- supVisitData %>%
+  ggplot(aes(x = regionTherapy,
+             y = score,
+             group = donorRegion,
+             color = regionTherapy)) +
+  #geom_boxplot(outlier.shape = NA) +
+  scale_color_manual(values = regionTherapyColorsRevLabs)+
+  geom_point(position = pd) +
+   geom_line(position = pd) +
+   #ylim(c(6,8))+
+  labs(x = "",
+       y = "Gene set score") +
+   theme(axis.text.x=element_text(angle=60, hjust=1),
+         axis.text=element_text(size=10),
+            axis.title=element_text(size=10)) +
+  facet_wrap(~sup)
+
+pdf(file.path(plotsDir, 
+              "DotPlot_SupKCGeneSetScoresInADGroupsColored.pdf"),
+    height = 5,
+    width = 8)
+
+print(gSupVisits)
+
+invisible(dev.off())
+
+```
+
+```{r compute_gene_set_score_stats}
+
+scoreStats <- supVisitData %>%
+  dplyr::group_by(sup) %>%
+  rstatix::t_test(score ~ regionTherapy, 
+                  comparisons = list(c("AD/NL, Dupi", "AD/NL"),
+                                     c("AD/L, Dupi","AD/L")),
+                  p.adjust.method = "fdr")
+
+write.csv(scoreStats,
+          file = file.path(tablesDir, "AD_supernatantGeneSetScores_Stats.csv"),
+          row.names = F)
+
+scoreStats <- supVisitData %>%
+  dplyr::group_by(sup) %>%
+  rstatix::t_test(score ~ regionTherapy, 
+                  comparisons = list(c("HC", "AD/NL"),
+                                     c("HC","AD/L")),
+                  p.adjust.method = "fdr")
+
+write.csv(scoreStats,
+          file = file.path(tablesDir, "AD_supernatantGeneSetScores_StatsHCComparisons.csv"),
+          row.names = F)
+
+scoreStats <- supVisitData %>%
+  dplyr::group_by(sup) %>%
+  rstatix::t_test(score ~ regionTherapy, 
+                  p.adjust.method = "fdr")
+
+write.csv(scoreStats,
+          file = file.path(tablesDir, "AD_supernatantGeneSetScores_StatsAllComparisons.csv"),
+          row.names = F)
+
+
+```
+
+# Differential expression
+
+```{r make_volcano_plots}
+
+plot_volcano <- function(top_table_in,
+                         fc_cutoff = 1,
+                         p_cutoff = 0.05,
+                         fc_for_anno = 2.5,
+                         p_for_anno = 0.1,
+                         y_max = 2.5,
+                         title = "",
+                         color_values = c("darkcyan", "red"),
+                         color_labels = NULL,
+                         anno_type = "or"){
+  
+  #top_table_in$gene_name <- rownames(top_table_in)
+  top_table_in$gene_name <- top_table_in$SYMBOL
+
+  if(anno_type == "or"){
+    selected_genes <- top_table_in %>%
+  dplyr::filter(abs(logFC) > fc_for_anno | adj.P.Val < p_for_anno)
+  }
+  
+  if(anno_type == "and"){
+    selected_genes <- top_table_in %>%
+  dplyr::filter(abs(logFC) > fc_for_anno & adj.P.Val < p_for_anno)
+  }
+  
+  if(anno_type == "top20"){
+    selected_genes <- top_table_in[1:20,]
+  }
+
+g_volcano <- ggplot(data = top_table_in, aes(x=logFC, y=-log10(adj.P.Val), color = logFC>0)) +
+  geom_point(alpha=0.7, size=2.5, shape = 19) +
+  #theme(legend.position = "none") +
+  scale_color_manual(values = color_values, name = "", labels = color_labels)+
+  xlab("log2 fold change") + ylab("-log10 FDR")+ ggtitle(title) +
+  geom_vline(xintercept=fc_cutoff, color="black", linetype="dotted",size=1.0) +
+  geom_vline(xintercept=-1*fc_cutoff, color="black", linetype="dotted",size=1.0)+
+  geom_hline(yintercept=-log10(p_cutoff), color="black",linetype="dotted",size=1.0)+
+   geom_text_repel(data = selected_genes,
+             aes(x=logFC, y=-log10(adj.P.Val),label=gene_name), 
+             size=2.5, vjust=1,hjust=0.5, color="black", max.overlaps = Inf)+
+  ylim(c(0,y_max))+
+  theme(text = element_text(size=12))
+
+return(g_volcano)
+
+}
+```
+
+```{r de_functions}
+save_DE_table <- function(top_genes, out_file){
+  top_genes$Gene <- rownames(top_genes)
+  top_genes <- top_genes %>%
+    dplyr::rename(log2FoldChange = logFC,
+                  pValue = P.Value,
+                  MultipleTestingCorrectedFDR = adj.P.Val) %>%
+    dplyr::select(Gene, log2FoldChange, pValue, MultipleTestingCorrectedFDR)
+  
+  write.csv(top_genes,
+            file.path(tablesDir,
+                      out_file),
+            row.names = F,
+            quote=F)
+}
+
+save_sig_table <- function(top_genes, 
+                           out_file,
+                           fdr_cut = 0.05,
+                           lfc_cut = 1){
+  
+  top_genes$Gene <- rownames(top_genes)
+  sig_genes <- top_genes %>%
+    dplyr::rename(log2FoldChange = logFC,
+                  pValue = P.Value,
+                  MultipleTestingCorrectedFDR = adj.P.Val) %>%
+    dplyr::filter(MultipleTestingCorrectedFDR <= fdr_cut,
+                  abs(log2FoldChange) >= lfc_cut) %>%
+    dplyr::select(Gene, log2FoldChange, pValue, MultipleTestingCorrectedFDR)
+  
+  write.csv(sig_genes,
+            file.path(tablesDir,
+                      out_file),
+            row.names = F,
+            quote=F)
+}
+
+get_sig_genes <- function(top_genes,
+                          lfc_cutoff = 1,
+                          fdr_cutoff = 0.05){
+  
+  if(!("ID" %in% colnames(top_genes))){
+    top_genes$gene <- rownames(top_genes)
+  }
+  
+  if("SYMBOL" %in% colnames(top_genes)){
+    top_genes$gene <- top_genes$SYMBOL
+  }
+  
+  if("Gene" %in% colnames(top_genes)){
+    top_genes$gene <- top_genes$Gene
+  }
+  
+  
+  sig_table <- top_genes %>%
+    dplyr::filter(abs(logFC) > lfc_cutoff,
+                  adj.P.Val < fdr_cutoff)
+  
+  sig_genes <- sig_table$gene
+  return(sig_genes)
+
+}
+
+get_top_n_genes <- function(top_genes,
+                            n = 20){
+  
+  top_genes$gene <- rownames(top_genes)
+  
+  top_n_table <- top_genes %>%
+    dplyr::arrange(adj.P.Val)
+  
+  top_n_table <- top_n_table[1:n,]
+  
+  top_n_genes <- top_n_table$gene
+  
+  return(top_n_genes)
+
+}
+
+save_sig_table_F <- function(top_genes, 
+                           out_file,
+                           fdr_cut = 0.05,
+                           lfc_cut = 1){
+  
+  top_genes$Gene <- rownames(top_genes)
+  sig_genes <- top_genes %>%
+    dplyr::rename(pValue = P.Value,
+                  MultipleTestingCorrectedFDR = adj.P.Val) %>%
+    dplyr::filter(MultipleTestingCorrectedFDR <= fdr_cut)
+  
+  write.csv(sig_genes,
+            file.path(tablesDir,
+                      out_file),
+            row.names = F,
+            quote=F)
+}
+
+```
+
+
+```{r de_region_therapy}
+
+#Order counts and design 
+annoComb <- droplevels(annoComb)
+countsPCNorm <- countsPCNorm[,annoComb$title]
+
+designMat <- model.matrix(~annoComb$regionTherapy+annoComb$dataset)
+
+#simplify columns names so contrasts are easier to make later
+colnames(designMat) <- colnames(designMat) %>%
+  str_remove_all("annoComb|dataset|regionTherapy") %>%
+  str_remove_all("\\$|\\(|\\)") %>%
+  str_replace_all("\\:", "_")
+  
+voom <- voomWithQualityWeights(countsPCNorm, design= designMat, plot=T, span=0.1)
+
+corfit <-
+  duplicateCorrelation(voom,
+                       design=designMat,
+                       block=annoComb$donorID)
+
+# #Run voom again. Recommended by G. Smyth
+# #https://support.bioconductor.org/p/59700/
+voom <- voomWithQualityWeights(countsPCNorm,
+                               design = designMat,
+                               block = annoComb$donorID,
+                               correlation =
+                                 corfit$consensus,
+                               plot = F)
+
+# fit model, including random effect
+vfit <-
+  lmFit(voom,
+        block=annoComb$donorID,
+        correlation=corfit$consensus.correlation)
+
+vfitEb <- eBayes(vfit)
+
+#Make contrasts
+contrast <- makeContrasts(
+  "non_lesional_none",
+  "lesional_none",
+  "non_lesional_none-non_lesional_dupilumab",
+  "lesional_none-lesional_dupilumab",
+  "lesional_dupilumab",
+  "non_lesional_dupilumab",
+  levels=designMat)
+
+contrastFit <- contrasts.fit(vfitEb, contrast)
+contrastFit <- eBayes(contrastFit)
+
+```
+
+```{r top_tables}
+
+topGenesLesionalVsHC <- topTable(contrastFit, 
+                                   coef = "lesional_none", 
+                                   sort.by = "P", 
+                                   number = Inf) 
+
+topGenesLesionalVsDupi <- topTable(contrastFit, 
+                                   coef = "lesional_none-lesional_dupilumab", 
+                                   sort.by = "P", 
+                                   number = Inf)
+
+topGenesDupiVsHC <- topTable(contrastFit, 
+                                   coef = "lesional_dupilumab", 
+                                   sort.by = "P", 
+                                   number = Inf)
+
+topGenesNonLesionalVsHC <- topTable(contrastFit, 
+                                   coef = "non_lesional_none", 
+                                   sort.by = "P", 
+                                   number = Inf) 
+
+topGenesNonLesionalDupiVsHC <- topTable(contrastFit, 
+                                   coef = "non_lesional_dupilumab", 
+                                   sort.by = "P", 
+                                   number = Inf) 
+
+geneStatTable <- data.frame(gene = rownames(topGenesNonLesionalDupiVsHC),
+                            adNonLesionalDupivsHC_LFC = topGenesNonLesionalDupiVsHC$logFC,
+                            adNonLesionalDupivsHC_FDR = topGenesNonLesionalDupiVsHC$adj.P.Val,
+                            
+                            adNonLesionalvsHC_LFC =  topGenesNonLesionalVsHC$logFC[match(rownames(topGenesNonLesionalDupiVsHC),
+                                                                          rownames(topGenesNonLesionalVsHC))],
+                            adNonLesionalvsHC_FDR =  topGenesNonLesionalVsHC$adj.P.Val[match(rownames(topGenesNonLesionalDupiVsHC),
+                                                                          rownames(topGenesNonLesionalVsHC))],
+                            
+                            adLesionalDupivsHC_LFC =  topGenesDupiVsHC$logFC[match(rownames(topGenesNonLesionalDupiVsHC),
+                                                                          rownames(topGenesDupiVsHC))],
+                            adLesionalDupivsHC_FDR =  topGenesDupiVsHC$adj.P.Val[match(rownames(topGenesNonLesionalDupiVsHC),
+                                                                          rownames(topGenesDupiVsHC))],
+                            
+                            adLesionalvsHC_LFC =  topGenesLesionalVsHC$logFC[match(rownames(topGenesNonLesionalDupiVsHC),
+                                                                          rownames(topGenesLesionalVsHC))],
+                            adLesionalvsHC_FDR =  topGenesLesionalVsHC$adj.P.Val[match(rownames(topGenesNonLesionalDupiVsHC),
+                                                                          rownames(topGenesLesionalVsHC))])
+
+write.csv(geneStatTable,
+          file.path(tablesDir, "externalADDifferentialExpressionStatistics.csv"),
+          quote = F,
+          row.names = F)
+
+```
+
+
+```{r ADLesionalVsHC}
+
+regionTherapyColors <- c("healthy_none" = "black",
+                         "non_lesional_dupilumab" = "blue",
+                         "non_lesional_none" = "darkcyan",
+                         "lesional_dupilumab" = "orange",
+                         "lesional_none" = "red")
+
+regionTherapyLabels <- c("healthy_none" = "HC",
+                         "non_lesional_dupilumab" = "AD_NonLesional_Dupi",
+                         "non_lesional_none" = "AD_NonLesional",
+                         "lesional_dupilumab" = "AD_Lesional_Dupi",
+                         "lesional_none" = "AD_Lesional")
+#Get genes that are differentially expressed in AD lesions vs HC
+sigGenesLesionalVsHC <- get_sig_genes(topGenesLesionalVsHC,
+                                lfc_cutoff = 1,
+                                fdr_cutoff = 0.05)
+
+
+hmapCounts <- batchCorCounts[sigGenesLesionalVsHC,annoComb$title]
+
+hmapAnno <- HeatmapAnnotation(Group = annoComb$regionTherapy,
+                              col = list(Group = regionTherapyColors))
+
+scaledCounts <- t(scale(t(hmapCounts)))
+
+hmap <- Heatmap(scaledCounts,
+                name = "Row z-score",
+                top_annotation = hmapAnno,
+                clustering_distance_columns = "manhattan",
+                show_column_names = FALSE,
+                show_row_names = FALSE)
+
+pdf(file.path(plotsDir, "Heatmap_ADLesionalVsHC.pdf"),
+    width = 7,
+    height = 6)
+
+draw(hmap)
+
+invisible(dev.off())
+
+
+```
+
+```{r ADLesionalVsLesionalDupi}
+
+#Get genes that are differentially expressed in AD lesions vs HC
+sigGenesLesionalVsDupi <- get_sig_genes(topGenesLesionalVsDupi,
+                                lfc_cutoff = 1,
+                                fdr_cutoff = 0.05)
+
+
+hmapCounts <- batchCorCounts[sigGenesLesionalVsDupi,annoComb$title]
+
+hmapAnno <- HeatmapAnnotation(Group = annoComb$regionTherapy,
+                              col = list(Group = regionTherapyColors))
+
+scaledCounts <- t(scale(t(hmapCounts)))
+
+hmap <- Heatmap(scaledCounts,
+                name = "Row z-score",
+                top_annotation = hmapAnno,
+                show_column_names = FALSE,
+                show_row_names = FALSE)
+
+pdf(file.path(plotsDir, "Heatmap_ADLesionalVsLesionalDupi.pdf"),
+    width = 7,
+    height = 6)
+
+draw(hmap)
+
+invisible(dev.off())
+
+
+```
+
+
+```{r intersect}
+
+#Examine overlap of genes that respond to treatment (overlap of HC vs AD and AD vs Dupi)
+
+sigGenes <- intersect(sigGenesLesionalVsHC,
+                      sigGenesLesionalVsDupi)
+
+hmapCounts <- batchCorCounts[sigGenes,annoComb$title]
+
+hmapAnno <- HeatmapAnnotation(Group = annoComb$regionTherapy,
+                              col = list(Group = regionTherapyColors))
+
+scaledCounts <- t(scale(t(hmapCounts)))
+
+hmap <- Heatmap(scaledCounts,
+                name = "Row z-score",
+                top_annotation = hmapAnno,
+                show_column_names = FALSE,
+                show_row_names = TRUE)
+
+pdf(file.path(plotsDir, "Heatmap_ADLesionalVsLesionalDupi_And_ADvsHC.pdf"),
+    width = 8,
+    height = 12)
+
+draw(hmap)
+
+invisible(dev.off())
+
+#Intersect Th2 with HC vs AD
+
+sigGenes <- intersect(sigGenesLesionalVsHC,
+                      supKCGeneSets$`Blood CD4+ Th2`$X1)
+
+hmapCounts <- batchCorCounts[sigGenes,annoComb$title]
+
+hmapAnno <- HeatmapAnnotation(Group = annoComb$regionTherapy,
+                              col = list(Group = regionTherapyColors))
+
+scaledCounts <- t(scale(t(hmapCounts)))
+
+hmap <- Heatmap(scaledCounts,
+                name = "Row z-score",
+                top_annotation = hmapAnno,
+                show_column_names = FALSE,
+                show_row_names = TRUE)
+
+pdf(file.path(plotsDir, "Heatmap_ADLesionalVsHC_and_Th2.pdf"),
+    width = 8,
+    height = 6)
+
+draw(hmap)
+
+invisible(dev.off())
+
+#Intersect more to Th2
+sigGenes <- intersect(sigGenesLesionalVsHC,
+                      sigGenesLesionalVsDupi)
+
+sigGenes <- intersect(sigGenes,
+                      supKCGeneSets$`Blood CD4+ Th2`$X1)
+
+hmapCounts <- batchCorCounts[sigGenes,annoComb$title]
+
+hmapAnno <- HeatmapAnnotation(Group = annoComb$regionTherapy,
+                              col = list(Group = regionTherapyColors))
+
+scaledCounts <- t(scale(t(hmapCounts)))
+
+hmap <- Heatmap(scaledCounts,
+                name = "Row z-score",
+                top_annotation = hmapAnno,
+                show_column_names = FALSE,
+                show_row_names = TRUE)
+
+pdf(file.path(plotsDir, "Heatmap_ADLesionalVsLesionalDupi_And_ADvsHC_InTh2.pdf"),
+    width = 8,
+    height = 4)
+
+draw(hmap)
+
+invisible(dev.off())
+
+```
+
+```{r ind_gene_plots}
+
+plot_gene <- function(gene,
+                      counts_in,
+                      design_in,
+                      save_plot = TRUE,
+                      log_scale = TRUE){
+ 
+  #Make sure libs in design and counts are in the same order
+  if(sum(design_in$filename != colnames(counts_in))!= 0){
+    print("Check to make sure the order of libraries in counts and design match")
+    return(NULL)}
+  
+  #Add gene count into to design_in
+  
+  design_in$gene <- counts_in[rownames(counts_in) == gene,]
+  
+  design_in <- design_in %>%
+  dplyr::mutate(regionTherapy = factor(regionTherapy,
+                                    levels = c("healthy_none",
+                                               "lesional_none",
+                                               "lesional_dupilumab",
+                                               "non_lesional_none",
+                                               "non_lesional_dupilumab")))
+  
+  counts_in <- counts_in[,design_in$title]
+  
+  if(log_scale == TRUE){
+    design_in$gene <- log2(design_in$gene +1)
+  }
+
+
+  g_gene_exp <- ggplot(design_in,
+           aes(x = regionTherapy,
+               y = gene,
+               #fill = stim,
+               color = regionTherapy))+
+      geom_boxplot(outlier.shape = NA)+
+      geom_quasirandom(dodge.width = 0.8)+
+      scale_color_manual(values = regionTherapyColors)+
+      #scale_y_continuous(limits = c(0, NA))+
+      labs(x = "",
+           y = paste0("Batch corrected expression"),
+           title = gene,
+           color = "")+
+    # scale_x_discrete(breaks=names(regionTherapyLabels),
+    #     labels=regionTherapyLabels)+
+      theme(axis.text.x = element_text(angle = 60, hjust = 1), 
+            text = element_text(size=12),
+            plot.title = element_text(hjust = 0.5)) +
+    guides(color="none")
+  
+   if(save_plot == TRUE){
+  filename <- file.path(plotsDir,
+                        paste(gene, "ADDatasets.pdf", sep = "_"))
+  
+  pdf(filename,
+      height = 4,
+      width = 3,
+      useDingbats = F)
+  print(g_gene_exp)
+  invisible(dev.off())
+  
+  }
+  
+  #print(g_gene_exp)
+  
+  return(g_gene_exp)
+}
+
+#Get ind gene plots of the Th2/ AD overlap genes
+
+lapply(sigGenes, function(x){
+  plot_gene(x,
+            counts_in = batchCorCounts,
+            design_in = annoComb,
+            save_plot = TRUE,
+            log_scale = FALSE)
+})
+
+
+```
+
+```{r ind_gene_stats}
+
+selGeneExpr <- cbind(annoComb, t(batchCorCounts[sigGenes,])) %>%
+  pivot_longer(cols = all_of(sigGenes),
+               names_to = "gene",
+               values_to = "expression")
+
+adGeneStatsKW <- selGeneExpr %>%
+  dplyr::group_by(gene) %>%
+  rstatix::kruskal_test(expression ~ regionTherapy)
+
+adGeneStatsDunnPostHoc <- selGeneExpr %>%
+  dplyr::group_by(gene) %>%
+  rstatix::dunn_test(expression ~ regionTherapy, p.adjust.method = "bonferroni")
+
+write.csv(adGeneStatsKW, file.path(tablesDir, "ADSelectedGeneStatsKruskalWallisTest.csv"), quote=FALSE, row.names = FALSE)
+write.csv(adGeneStatsDunnPostHoc, file.path(tablesDir, "ADSelectedGeneStatstatsDunnPostHocComparisons.csv"), quote=FALSE, row.names = FALSE)
+```
+
+
+```{r get_enrichment}
+library(clusterProfiler)
+#Make a TERM2NAME data frame
+geneSets <- data.table::rbindlist(supKCGeneSets[c("Blood CD4+ Th1",
+                        "Blood CD4+ Th2",
+                        "Blood CD4+ Th17",
+                        "Blood CD4+ Th22",
+                        "Blood CD4+ CD103+")], 
+                        idcol = "name")
+names(geneSets) <- c("name", "geneID")
+
+getGSEAStats <- function(topGenesIn,
+                         geneSetsIn,
+                         compIn = NULL){
+  
+  topGenesSorted <- topGenesIn %>%
+    dplyr::arrange(desc(logFC)) 
+  
+  gseaGeneList <- topGenesSorted$logFC
+  names(gseaGeneList) <- rownames(topGenesSorted)
+  
+  gsea <- GSEA(gseaGeneList, 
+               TERM2GENE = geneSetsIn,
+               pvalueCutoff = 1)
+
+  gsea <- gsea@result
+  
+  gsea$comparison <- compIn
+  
+  gsea$coreEnrichCount <- str_count(gsea$core_enrichment, "\\/")+1
+  
+  gsea$frac <- gsea$coreEnrichCount/gsea$setSize
+  
+  return(gsea)
+}
+
+gseaLesionalVsHC <- getGSEAStats(topGenesLesionalVsHC,
+                     geneSets, 
+                     "AD lesional vs HC")
+
+gseaLesionalVsDupi <- getGSEAStats(topGenesLesionalVsDupi,
+                     geneSets,
+                     "AD lesional vs Dupi lesional")
+
+gseaDupiVsHC <- getGSEAStats(topGenesDupiVsHC,
+                     geneSets,
+                     "Dupi lesional vs HC")
+
+gseaStats <- bind_rows(gseaLesionalVsHC,
+                      gseaLesionalVsDupi,
+                      gseaDupiVsHC)
+
+```
+
+```{r gsea_radar_plot}
+
+library(fmsb)
+
+gseaForRadar <- gseaStats %>%
+  dplyr::mutate(log10p = -log10(`p.adjust`)) %>%
+  dplyr::mutate(comparison = factor(comparison,
+                                    levels = c("AD lesional vs HC",
+                                               "AD lesional vs Dupi lesional",
+                                               "Dupi lesional vs HC"))) %>%
+  dplyr::select(Description, comparison, log10p) %>%
+  tidyr::spread(key = Description, value = log10p) %>%
+  as.data.frame() 
+
+rownames(gseaForRadar) <- gseaForRadar$comparison
+gseaForRadar$comparison <- NULL
+
+gseaForRadar <- rbind("max" = rep(ceiling(max(gseaForRadar)),ncol(gseaForRadar)),
+                      "min" = c(0,0,0,0),
+                      gseaForRadar) 
+
+
+compColors <- c("#00AFBB", "#E7B800", "#FC4E07")
+
+pdf(file.path(plotsDir, "radarPValuePlotInAD.pdf"),
+    height = 6,
+    width = 6)
+
+op <- par(mar = c(1, 2, 2, 2))
+
+radarchart(gseaForRadar,
+           pcol = compColors, 
+           pfcol = scales::alpha(compColors, 0.2),
+           axistype = 1,
+           caxislabels = c(2, 4, 6, 8, 10),
+           axislabcol = "grey", 
+           plwd = 2, 
+           plty = 1)
+
+legend(
+  x = "topright", legend = rownames(gseaForRadar[-c(1,2),]), horiz = FALSE,
+  bty = "n", pch = 20 , col = compColors,
+  text.col = "black", cex = 1, pt.cex = 1.5
+  )
+
+par(op)
+
+invisible(dev.off())
+
+
+```
+
+```{r gsea_dot_plot}
+gseaDot <- gseaStats  %>% 
+  dplyr::mutate(Description = factor(Description,
+                                     levels = rev(c("Blood CD4+ CD103+",
+                                                "Blood CD4+ Th1",
+                        "Blood CD4+ Th2",
+                        "Blood CD4+ Th17",
+                        "Blood CD4+ Th22")))) %>% 
+  ggplot(aes(x=comparison, y = Description, color = -log10(`p.adjust`), size = frac)) + 
+  geom_point() +
+    scale_color_gradientn(colours = viridis::viridis(20)) +
+  scale_y_discrete(position = "right") +
+  labs(x = "",
+       y = "",
+       color = "-log10 adj P",
+       size = "proportion of signature genes\nin GSEA core enrichment") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1),
+        text = element_text(size=12)) 
+
+pdf(file.path(plotsDir, "Dotplot_GSEA_KCSupSigsInADGroups.pdf"),
+    height = 5,
+    width = 6)
+
+print(gseaDot)
+
+invisible(dev.off())
+
+
+```
+
+
+```{r lfc_plot}
+
+# Plot LFC in PS vs HC against LFC in PS vs anti IL17
+# Color genes by membership in KC Sup stimulated tests
+
+combinedTopGenes <- data.frame("gene" = rownames(topGenesLesionalVsHC),
+                               "LesionalvsHC_LFC" = topGenesLesionalVsHC$logFC,
+                               "LesionalvsHC_FDR" = topGenesLesionalVsHC$adj.P.Val,
+                               "LesionalvsDupi_LFC" = topGenesLesionalVsDupi$logFC[match(rownames(topGenesLesionalVsHC),
+                                                                          rownames(topGenesLesionalVsDupi))],
+                               "LesionalvsDupi_FDR" = topGenesLesionalVsDupi$adj.P.Val[match(rownames(topGenesLesionalVsHC),
+                                                                              rownames(topGenesLesionalVsDupi))])
+
+combinedTopGenes$Th1GeneSet <- combinedTopGenes$gene %in% supKCGeneSets$`Blood CD4+ Th1`$X1
+combinedTopGenes$Th2GeneSet <- combinedTopGenes$gene %in% supKCGeneSets$`Blood CD4+ Th2`$X1
+combinedTopGenes$Th17GeneSet <- combinedTopGenes$gene %in% supKCGeneSets$`Blood CD4+ Th17`$X1
+combinedTopGenes$Th22GeneSet <- combinedTopGenes$gene %in% supKCGeneSets$`Blood CD4+ Th22`$X1
+combinedTopGenes$CD103GeneSet <- combinedTopGenes$gene %in% supKCGeneSets$`Blood CD4+ CD103+`$X1
+
+#Make a column that reports the names of the gene sets that the gene is in
+
+combinedTopGenes$geneSetMembership <- NA
+
+for(i in 1:nrow(combinedTopGenes)){
+  combinedTopGenes$geneSetMembership[i] <- paste(names(combinedTopGenes[i,6:10])[combinedTopGenes[i,6:10] == TRUE],
+                                                 collapse = ",")
+}
+
+combinedTopGenes$geneSetMembershipNumber <- rowSums(combinedTopGenes[,6:10])
+
+combinedTopGenes <- combinedTopGenes %>%
+  dplyr::mutate(geneSetMembershipSimplified = case_when(combinedTopGenes$geneSetMembership == "Th1GeneSet,Th17GeneSet" ~ "Multiple: Blood CD4+ Th1 and Th17",
+                                                        combinedTopGenes$geneSetMembership == "Th1GeneSet,Th2GeneSet" ~ "Multiple: Blood CD4+ Th1 and Th2",
+                                                        combinedTopGenes$geneSetMembershipNumber >=2 ~ "Multiple: Other",
+                                                        Th1GeneSet == TRUE ~ "Blood CD4+ Th1",
+                                                        Th2GeneSet == TRUE ~ "Blood CD4+ Th2",
+                                                        Th17GeneSet == TRUE ~ "Blood CD4+ Th17",
+                                                        Th22GeneSet == TRUE ~ "Blood CD4+ Th22",
+                                                        CD103GeneSet == TRUE ~ "Blood CD4+ CD103+",
+                                                        TRUE ~ "None"),
+                geneSetMembershipSimplified = factor(geneSetMembershipSimplified,
+                                                     levels = c("Blood CD4+ CD103+",
+                                                                "Blood CD4+ Th1",
+                                                                "Blood CD4+ Th2",
+                                                                "Blood CD4+ Th17",
+                                                                "Blood CD4+ Th22",
+                                                                "Multiple: Blood CD4+ Th1 and Th17",
+                                                                "Multiple: Blood CD4+ Th1 and Th2",
+                                                                "Multiple: Other",
+                                                                "None")))
+
+#Add gene labels for genes that are in the Th17 gene set and have a LFC > 1 in PS vs HC or PS vs anti IL17
+combinedTopGenes$geneLabel <- ifelse(combinedTopGenes$geneSetMembershipSimplified != "None" &
+                                          (combinedTopGenes$LesionalvsDupi_LFC > 2 | combinedTopGenes$LesionalvsHC_LFC > 2), combinedTopGenes$gene, NA)
+
+
+geneSetMembershipColors <- c("Blood CD4+ CD103+"= "#FF3333", 
+                    "Blood CD4+ Th1" = "#993333", 
+                    "Blood CD4+ Th17" = "#FFCC66", 
+                    "Blood CD4+ Th2" = "#66CCFF", 
+                    "Blood CD4+ Th22" = "#009966", 
+                    "Multiple: Blood CD4+ Th1 and Th17" = "#993333",
+                    "Multiple: Blood CD4+ Th1 and Th2" = "#009966",
+                    "Multiple: Other" =  "#000000", 
+                    "None" = "#D3D3D3") 
+
+geneSetMembershipBorderColors <- c("Blood CD4+ CD103+"= "#FF3333", 
+                    "Blood CD4+ Th1" = "#993333", 
+                    "Blood CD4+ Th17" = "#FFCC66", 
+                    "Blood CD4+ Th2" = "#66CCFF", 
+                    "Blood CD4+ Th22" = "#009966", 
+                    "Multiple: Blood CD4+ Th1 and Th17" = "#FFCC66",  
+                    "Multiple: Blood CD4+ Th1 and Th2" = "#FFCC66", 
+                    "Multiple: Other" =  "#000000", 
+                    "None" = "#D3D3D3")  
+
+gScatter <- ggplot() +
+  # geom_point(data = combinedTopGenes[combinedTopGenes$geneSetMembershipSimplified == "None",], 
+  #            aes(x = LesionalvsHC_LFC,
+  #            y = LesionalvsDupi_LFC,
+  #            color = geneSetMembershipSimplified,
+  #            fill = geneSetMembershipSimplified),
+  #            shape = 21) +
+  geom_point(data = combinedTopGenes[combinedTopGenes$geneSetMembershipSimplified != "None",], 
+             aes(x = LesionalvsHC_LFC,
+             y = LesionalvsDupi_LFC,
+             color = geneSetMembershipSimplified,
+             fill = geneSetMembershipSimplified),
+             shape = 21) +
+  geom_text_repel(data = combinedTopGenes[!is.na(combinedTopGenes$geneLabel),], 
+            aes(x = LesionalvsHC_LFC,
+             y = LesionalvsDupi_LFC,
+             label = gene),
+            max.overlaps = Inf) +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  geom_abline(slope = 1,
+              intercept = 0) +
+  scale_color_manual(values = geneSetMembershipColors) +
+  scale_fill_manual(values = geneSetMembershipBorderColors) +
+  labs(x = "Log2 fold change, AD vs HC",
+       y = "Log2 fold change, AD vs dupi",
+       color = "Signature membership",
+       fill = "Signature membership") +
+  xlim(c(-4,4)) +
+  ylim(c(-4,4)) +
+  theme(aspect.ratio = 1)
+
+pdf(file.path(plotsDir, "Scatterplot_LFCADVsHC_LFCADVsDupi.pdf"),
+    height = 6,
+    width = 10)
+
+print(gScatter)
+invisible(dev.off())
+
+```
+
+
+```{r de_region}
+
+#Order counts and design 
+annoNone <- annoComb %>%
+  dplyr::filter(therapy == "none")
+countsNone <- countsPCNorm[,annoNone$title]
+
+designMat <- model.matrix(~annoNone$region+annoNone$dataset)
+
+#simplify columns names so contrasts are easier to make later
+colnames(designMat) <- colnames(designMat) %>%
+  str_remove_all("annoNone|dataset|region") %>%
+  str_remove_all("\\$|\\(|\\)") %>%
+  str_replace_all("\\:", "_")
+  
+voom <- voomWithQualityWeights(countsNone, design= designMat, plot=T, span=0.1)
+
+corfit <-
+  duplicateCorrelation(voom,
+                       design=designMat,
+                       block=annoNone$donorID)
+
+# #Run voom again. Recommended by G. Smyth
+# #https://support.bioconductor.org/p/59700/
+voom <- voomWithQualityWeights(countsNone,
+                               design = designMat,
+                               block = annoNone$donorID,
+                               correlation =
+                                 corfit$consensus,
+                               plot = F)
+
+# fit model, including random effect
+vfit <-
+  lmFit(voom,
+        block=annoNone$donorID,
+        correlation=corfit$consensus.correlation)
+
+vfitEb <- eBayes(vfit)
+
+#Make contrasts
+contrast <- makeContrasts(
+  "non_lesional",
+  "lesional",
+  "chronic_lesion",
+  "lesional-non_lesional",
+  levels=designMat)
+
+contrastFit <- contrasts.fit(vfitEb, contrast)
+contrastFit <- eBayes(contrastFit)
+
+```
+
+```{r top_tables, fig.width=11, fig.height=15}
+
+topGenesLesionalVsNormal <- topTable(contrastFit, 
+                                   coef = "lesional", 
+                                   sort.by = "P", 
+                                   number = Inf)
+
+topGenesNonLesionalVsNormal <- topTable(contrastFit, 
+                                   coef = "non_lesional", 
+                                   sort.by = "P", 
+                                   number = Inf)
+
+topGenesChronicLesionalVsNormal <- topTable(contrastFit, 
+                                   coef = "chronic_lesion", 
+                                   sort.by = "P", 
+                                   number = Inf)
+
+topGenesLesionalVsNonLesional <- topTable(contrastFit, 
+                                   coef = "lesional-non_lesional", 
+                                   sort.by = "P", 
+                                   number = Inf)
+
+```
+
+```{r de_dupi}
+
+#Order counts and design 
+annoDupi <- annoComb %>%
+  dplyr::filter(region == "non_lesional" | region == "lesional",
+                therapy != "cyclosporine") %>%
+  droplevels()
+countsDupi <- countsPCNorm[,annoDupi$title]
+
+designMatDupi <- model.matrix(~annoDupi$therapy*annoDupi$region+annoDupi$dataset)
+
+#simplify columns names so contrasts are easier to make later
+colnames(designMatDupi) <- colnames(designMatDupi) %>%
+  str_remove_all("annoDupi|dataset|region|therapy") %>%
+  str_remove_all("\\$|\\(|\\)") %>%
+  str_replace_all("\\:", "_")
+  
+voomDupi <- voomWithQualityWeights(countsDupi, design= designMatDupi, plot=T, span=0.1)
+
+corfitDupi <-
+  duplicateCorrelation(voomDupi,
+                       design=designMatDupi,
+                       block=annoDupi$donorID)
+
+# #Run voom again. Recommended by G. Smyth
+# #https://support.bioconductor.org/p/59700/
+voomDupi <- voomWithQualityWeights(countsDupi,
+                               design = designMatDupi,
+                               block = annoDupi$donorID,
+                               correlation =
+                                 corfitDupi$consensus,
+                               plot = F)
+
+# fit model, including random effect
+vfitDupi <-
+  lmFit(voomDupi,
+        block=annoDupi$donorID,
+        correlation=corfitDupi$consensus.correlation)
+
+vfitEbDupi <- eBayes(vfitDupi)
+
+#Make contrasts
+contrastDupi <- makeContrasts(
+  "dupilumab",
+  "dupilumab+dupilumab_lesional",
+  "lesional",
+  "lesional+dupilumab_lesional",
+  levels=designMatDupi)
+
+contrastFitDupi <- contrasts.fit(vfitEbDupi, contrastDupi)
+contrastFitDupi <- eBayes(contrastFitDupi)
+
+```
+
+```{r top_tables_dupi, fig.width=11, fig.height=15}
+
+topGenesLesionalVsNonLesionalNoTreatement <- topTable(contrastFitDupi, 
+                                   coef = "lesional", 
+                                   sort.by = "P", 
+                                   number = Inf)
+
+topGenesLesionalVsNonLesionalDupi <- topTable(contrastFitDupi, 
+                                   coef = "lesional+dupilumab_lesional", 
+                                   sort.by = "P", 
+                                   number = Inf)
+
+topGenesDupiVsNoTreatmentNonLesional <- topTable(contrastFitDupi, 
+                                   coef = "dupilumab", 
+                                   sort.by = "P", 
+                                   number = Inf)
+
+topGenesDupiVsNoTreatmentLesional <- topTable(contrastFitDupi, 
+                                   coef = "dupilumab+dupilumab_lesional", 
+                                   sort.by = "P", 
+                                   number = Inf)
+```
+
+```{r volcano_plots_highlight_genes}
+
+plot_volcano_set_genes <- function(top_table_in,
+                                   gene_list,
+                         fc_cutoff = 1,
+                         p_cutoff = 0.05,
+                         title = "",
+                         y_max = 45,
+                         color_values = c("darkcyan", "red"),
+                         color_labels = c("HC", "AD/L")){
+  
+  top_table_in$gene_name <- rownames(top_table_in)
+  #top_table_in$gene_name <- top_table_in$SYMBOL
+  
+    selected_genes <- top_table_in %>%
+      dplyr::filter(gene_name %in% gene_list)
+
+g_volcano <- ggplot(data = top_table_in, aes(x=logFC, y=-log10(adj.P.Val), color = logFC>0)) +
+  geom_point(alpha=0.7, size=2.5, shape = 19) +
+  #theme(legend.position = "none") +
+  scale_color_manual(values = color_values, name = "", labels = color_labels)+
+  xlab("log2 fold change") + ylab("-log10 FDR")+ ggtitle(title) +
+  #geom_vline(xintercept=fc_cutoff, color="black", linetype="dotted",size=1.0) +
+  geom_vline(xintercept=-1*fc_cutoff, color="black", linetype="dotted",size=1.0)+
+  geom_hline(yintercept=-log10(p_cutoff), color="black",linetype="dotted",size=1.0)+
+    geom_point(data = selected_genes,
+             aes(x=logFC, y=-log10(adj.P.Val)),
+             color = "black", size=2.5, shape = 19) +
+   geom_text_repel(data = selected_genes[1:20,],
+             aes(x=logFC, y=-log10(adj.P.Val),label=gene_name), 
+             size=3, vjust=1,hjust=0.5, color="black", max.overlaps = Inf)+
+  ylim(c(0,y_max))+
+  theme(text = element_text(size=16))
+
+return(g_volcano)
+
+}
+
+volcanoHeight <- 400
+volcanoWidth <- 500
+
+gHCvsPSTh1 <- plot_volcano_set_genes(topGenesLesionalVsNormal,
+             supKCGeneSets$`Blood CD4+ Th1`$X1)
+gHCvsPSTh2 <- plot_volcano_set_genes(topGenesLesionalVsNormal,
+             supKCGeneSets$`Blood CD4+ Th2`$X1)
+gHCvsPSTh17 <- plot_volcano_set_genes(topGenesLesionalVsNormal,
+             supKCGeneSets$`Blood CD4+ Th17`$X1)
+gHCvsPSTh22 <- plot_volcano_set_genes(topGenesLesionalVsNormal,
+             supKCGeneSets$`Blood CD4+ Th22`$X1)
+gHCvsPSCD103 <- plot_volcano_set_genes(topGenesLesionalVsNormal,
+             supKCGeneSets$`Blood CD4+ CD103+`$X1)
+
+png(file.path(plotsDir, 
+              "Volcano_ADLesionalVsHC_BloodTh1PosSig.png"),
+    height = volcanoHeight, 
+    width = volcanoWidth)
+
+print(gHCvsPSTh1)
+
+invisible(dev.off())
+
+png(file.path(plotsDir, 
+              "Volcano_ADLesionalVsHC_BloodTh2PosSig.png"),
+    height = volcanoHeight, 
+    width = volcanoWidth)
+
+print(gHCvsPSTh2)
+
+invisible(dev.off())
+
+
+png(file.path(plotsDir, 
+              "Volcano_ADLesionalVsHC_BloodTh17PosSig.png"),
+    height = volcanoHeight, 
+    width = volcanoWidth)
+
+print(gHCvsPSTh17)
+
+invisible(dev.off())
+
+png(file.path(plotsDir, 
+              "Volcano_ADLesionalVsHC_BloodTh22PosSig.png"),
+    height = volcanoHeight, 
+    width = volcanoWidth)
+
+print(gHCvsPSTh22)
+
+invisible(dev.off())
+
+png(file.path(plotsDir, 
+              "Volcano_ADLesionalVsHC_BloodCD103PosSig.png"),
+    height = volcanoHeight, 
+    width = volcanoWidth)
+
+print(gHCvsPSCD103)
+
+invisible(dev.off())
+
+```
+
+```{r sup_ps_intersect_hmap}
+
+sigGenes <- intersect(supKCGeneSets$`Blood CD4+ Th1`$X1,
+                      get_sig_genes(topGenesLesionalVsNormal))
+
+sigGenes <- sigGenes[sigGenes %in% rownames(batchCorCounts)]
+
+#For consistency with dot plots and to avoid repeated samples, remove PS untreated wk 2 profiles
+hmapAnno <- annoNone 
+
+hmapCounts <- batchCorCounts[sigGenes,hmapAnno$title]
+
+columnAnno <- HeatmapAnnotation(Group = hmapAnno$region,
+                                col = list(Group = regionColors)) 
+
+scaledCounts <- t(scale(t(hmapCounts))) 
+
+hmap <- Heatmap(scaledCounts,
+                name = "row z-score",
+                cluster_columns = TRUE,
+                top_annotation = columnAnno,
+                show_column_names = FALSE,
+                show_row_names = TRUE)
+
+
+draw(hmap)
+
+pdf(file.path(plotsDir, 
+              "Heatmap_ADNoTreatment_KCsupTh1PosLesionalVsNormalIntersectGenes.pdf"),
+    height = 6, 
+    width = 8)
+
+draw(hmap)
+
+invisible(dev.off())
+
+```
+
+```{r barcodeplots}
+
+library(clusterProfiler)
+library(enrichplot)
+library(viridis)
+#Make a TERM2NAME data frame
+geneSets <- data.table::rbindlist(supKCGeneSets[c("Blood CD4+ Th1",
+                        "Blood CD4+ Th2",
+                        "Blood CD4+ Th17",
+                        "Blood CD4+ Th22",
+                        "Blood CD4+ CD103+")], idcol = "name")
+names(geneSets) <- c("name", "geneID")
+
+topGenesSorted <- topGenesDupiVsNoTreatmentLesional %>%
+  dplyr::mutate(logFC = -1*logFC) %>%
+  dplyr::arrange(desc(logFC)) 
+
+gseaGeneList <- topGenesSorted$logFC
+names(gseaGeneList) <- rownames(topGenesSorted)
+
+gsea <- GSEA(gseaGeneList, 
+             TERM2GENE = geneSets,
+             pvalueCutoff = 1)
+
+supGeneSetColors <- rcartocolor::carto_pal(5, "Vivid")
+names(supGeneSetColors) <- sort(unique(geneSets$name))
+
+gBarcode <- gseaplot2(gsea, 
+          geneSetID = 1:5, 
+          pvalue_table = TRUE,
+          color = supGeneSetColors,
+          subplots = 1:2)
+
+pdf(file.path(plotsDir, "BarcodePlot_supKCGeneSets_ADRNAseq_DupiVsNoneInLesionalSkin.pdf"),
+    height = 5,
+    width = 8)
+
+print(gBarcode)
+
+invisible(dev.off())
+
+#dotplot(gsea)
+options(ggrepel.max.overlaps = Inf)
+
+
+gCnetplot <- cnetplot(gsea, 
+                      foldChange=gseaGeneList,
+                      showCategory=5,
+                      max.overlaps=Inf) +
+  scale_color_viridis(name = "Log2 fold change\nUntreated:Dupi in lesional skin",
+                      limits = c(0,5))
+
+
+pdf(file.path(plotsDir, "CnetplotPlot_supKCGeneSets_ADRNAseq_DupiVsNoneInLesionalSkin.pdf"),
+    height = 6,
+    width = 10)
+
+print(gCnetplot)
+
+invisible(dev.off())
+#heatplot(gsea, foldChange = gseaGeneList, showCategory=5)
+#upsetplot(gsea)
+#ridgeplot(gsea)
+```
+
+

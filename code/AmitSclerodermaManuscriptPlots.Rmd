@@ -1,0 +1,766 @@
+---
+title: "MAS and control monocytes, gene signature examination"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    number_sections: true
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, echo=FALSE, message=FALSE, warning=FALSE}
+library(knitr)
+library(dplyr)
+library(ggplot2); theme_set(
+  theme_bw(20) +
+    theme(panel.grid.major = element_blank(),
+          panel.grid.minor = element_blank(),
+          panel.border = element_rect(colour="black", fill=NA, size=1),
+          axis.text=element_text(colour="black"),
+          axis.ticks=element_line(colour="black"),
+          legend.key = element_blank(),
+          strip.text.x = element_text(size = 14,margin = margin( b = 2, t = 2) ),
+            strip.background = element_rect(fill="white", colour="black")))
+
+library(ggthemes)
+library(ggbeeswarm)
+library(viridis)
+library(stringr)
+library(readxl)
+library(kableExtra)
+library(RColorBrewer)
+library(plotly)
+library(tidyr)
+library(gtools)
+#library(devtools)  #if needed to obtain github packages
+# install_github('mjdufort/TCRtools') #if needed to get Matt Dufort's package
+#library(edgeR)
+library(ggrepel)
+library(ComplexHeatmap)
+library(umap)
+library(forcats)
+library(Seurat)
+library(randomcoloR)
+library(apird)
+library(GGally)
+
+opts_chunk$set(fig.width=6, fig.height=4.0, cache = TRUE, echo=FALSE, warning=FALSE, message=FALSE, cache.lazy = FALSE, results='hide')
+opts_knit$set(root.dir = "/Users/hdeberg/Box/P407_MASsJIA10X_CannyHamerman")
+
+options(stringsAsFactors = FALSE)
+
+```
+
+```{r set_up_directories, cache = TRUE}
+
+baseDir <- "/Users/hdeberg/Box/P253_PeterM_Campbell_Keratinocytes_Fibroblasts/scleroderma"
+plotDir <- file.path(baseDir, "plots")
+tableDir <- file.path(baseDir, "tables")
+dataDir <- file.path(baseDir, "data")
+geoDataDir <- file.path(baseDir, "geoData", "GSE195452_RAW")
+
+```
+
+```{r set_colors}
+
+groupColors <- rcartocolor::carto_pal(5, "Vivid")
+names(groupColors) <- c("Control",
+                        "LSSC",
+                        "DSSC",
+                        "GVHD",
+                        "localized_scleroderma")
+
+```
+
+```{r read_in_merged_seurat_object}
+
+load(file.path(dataDir, "SeuratMerged.RData"))
+
+```
+
+```{r check_data}
+
+ DimPlot(object = seuratMerged, 
+                          reduction = "umap", 
+                          group.by = "AmitAnnotation",
+                          shuffle = TRUE)+
+  labs(x = "UMAP 1", y ="UMAP 2", title = "Group") +
+  theme(aspect.ratio = 1,
+        text = element_text(size = 24))
+
+
+```
+
+```{r subset_to_fibroblasts}
+
+#Keep cells which the Amit paper annotated as fibroblasts and that cluster with fibroblasts
+
+#Keep all cells with Amit fibroblast annotations except the "Bad" group
+
+seuratMerged$hasAmitFibAnno <- str_detect(seuratMerged$AmitAnnotation, "^Fibro")
+seuratMerged$hasAmitFibAnno[seuratMerged$AmitAnnotation == "Fibro_Bad"] <- FALSE
+
+seuratFibs <- subset(seuratMerged, 
+                      subset =  hasAmitFibAnno == TRUE)
+
+#Remove GVHD, localized scleroderma samples
+seuratFibs <- subset(seuratFibs, 
+                      subset =  (Group == "Control" | Group == "DSSC" | Group == "LSSC"))
+
+
+#Check
+table(seuratFibs$AmitAnnotation, useNA= "ifany")
+```
+
+```{r process_data}
+
+seuratFibs <- NormalizeData(object = seuratFibs, verbose = FALSE)
+seuratFibs <- FindVariableFeatures(object = seuratFibs, 
+        selection.method = "vst", nfeatures = 2000, verbose = FALSE)
+
+seuratFibs <- ScaleData(object = seuratFibs, verbose = FALSE)
+seuratFibs <- RunPCA(object = seuratFibs, npcs = 30, verbose = FALSE)
+#ElbowPlot(seuratFibs)
+
+seuratFibs <- FindNeighbors(seuratFibs, dims = 1:30)
+seuratFibs <- FindClusters(seuratFibs, resolution = 0.5)
+
+seuratFibs <- RunUMAP(object = seuratFibs, reduction = "pca", 
+    dims = 1:30)
+
+```
+
+```{r plot_umap}
+groupSubColors <- groupColors[c("Control", "DSSC", "LSSC")]
+
+gFibsGroup <- DimPlot(object = seuratFibs, 
+                          reduction = "umap", 
+                          group.by = "Group",
+                          shuffle = TRUE,
+                      pt.size = 0.1,
+                      raster = FALSE)+
+  scale_color_manual(values = groupSubColors)+
+  labs(x = "UMAP 1", y ="UMAP 2", title = "Group") +
+  theme(aspect.ratio = 1,
+        text = element_text(size = 16))
+
+
+pdf(file.path(plotDir, "UMAP_AmitSSc_Fibroblasts_Group.pdf"),
+    height = 4, 
+    width = 6)
+
+print(gFibsGroup)
+
+invisible(dev.off())
+
+cellTypeColors <- rcartocolor::carto_pal(10, "Vivid")
+names(cellTypeColors) <- sort(unique(seuratFibs$AmitAnnotation))
+
+gFibsAmitGroup <- DimPlot(object = seuratFibs, 
+                          reduction = "umap", 
+                          group.by = "AmitAnnotation",
+                          shuffle = TRUE,
+                      pt.size = 0.1,
+                      raster = FALSE)+
+  scale_color_manual(values = cellTypeColors)+
+  labs(x = "UMAP 1", y ="UMAP 2", title = "Cell type") +
+  theme(aspect.ratio = 1,
+        text = element_text(size = 16))
+
+
+pdf(file.path(plotDir, "UMAP_AmitSSc_Fibroblasts_AmitAssignedCellType.pdf"),
+    height = 4, 
+    width = 6)
+
+print(gFibsAmitGroup)
+
+invisible(dev.off())
+
+gFibsLGR5 <- FeaturePlot(object = seuratFibs, 
+                         pt.size = 0.1,
+                          reduction = "umap", 
+                          features = c("LGR5"),
+                          order = TRUE,
+                         raster = FALSE)+
+  labs(x = "UMAP 1", y ="UMAP 2", title = "LGR5 expression") +
+  theme(aspect.ratio = 1,
+        text = element_text(size = 16))
+
+
+pdf(file.path(plotDir, "UMAP_AmitSSc_Fibroblasts_LGR5.pdf"),
+    height = 4, 
+    width = 6)
+
+print(gFibsLGR5)
+
+invisible(dev.off())
+
+```
+
+```{r plot_proportions_of_cells_per_donor}
+
+seuratFibs$Group <- factor(seuratFibs$Group, levels = c("Control", "LSSC", "DSSC"))
+
+seuratFibs$diseaseDuration <- seuratFibs$Duration
+seuratFibs$diseaseDuration[seuratFibs$Group == "Control"] <- 0
+seuratFibs$diseaseDuration <- as.numeric(seuratFibs$diseaseDuration)
+
+totalCellCounts <- seuratFibs@meta.data %>%
+  dplyr::group_by(patientID) %>%
+  dplyr::summarise(nCellsTot = n(),
+                   Group = unique(Group),
+                   Autoantibody_Cat = unique(Autoantibody_Cat),
+                   Skin_Score = unique(Skin_Score),
+                   diseaseDuration = unique(diseaseDuration))
+
+donorFibCounts <- seuratFibs@meta.data %>%
+  dplyr::group_by(patientID, AmitAnnotation) %>%
+  dplyr::summarise(nCells= n()) %>%
+  dplyr::ungroup() %>%
+  complete(patientID, AmitAnnotation, fill = list(nCells = 0))
+
+donorFibCounts <- left_join(donorFibCounts, totalCellCounts)
+
+donorFibCounts <- donorFibCounts%>%
+  dplyr::mutate(propCells = nCells/nCellsTot)
+
+#Boxplots of proportions
+
+gBoxProportions <- donorFibCounts %>%
+  ggplot(aes(x=Group, 
+             y=propCells)) + 
+  geom_boxplot(outlier.shape = NA) +
+  geom_quasirandom() +
+  labs(x = "",
+       y = "Fraction of cells in donor",
+       fill = "")+ 
+  scale_y_continuous(labels = scales::percent) +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) +
+  facet_wrap(~AmitAnnotation, 
+             scales = "free_y")
+
+pdf(file.path(plotDir, "BoxPlots_AmitSSc_CellTypeProportions.pdf"),
+    height = 8, 
+    width = 14)
+
+print(gBoxProportions)
+
+invisible(dev.off())
+
+#Boxplots of LGR5 proportions
+
+gBoxProportions <- donorFibCounts %>%
+  dplyr::filter(AmitAnnotation == "Fibro_LGR5") %>% 
+  ggplot(aes(x=Group, 
+             y=propCells)) + 
+  geom_boxplot(outlier.shape = NA) +
+  geom_quasirandom() +
+  labs(x = "",
+       y = "Fraction of cells in donor",
+       fill = "")+ 
+  scale_y_continuous(labels = scales::percent) +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+
+pdf(file.path(plotDir, "BoxPlot_AmitSSc_LGR5Proportions.pdf"),
+    height = 6, 
+    width = 6)
+
+print(gBoxProportions)
+
+invisible(dev.off())
+
+
+```
+
+```{r pseudobulk}
+
+pseudoFibs <- AggregateExpression(seuratFibs, 
+                                  assays = "RNA", 
+                                  return.seurat = T, 
+                                  group.by = c("patientID", "Group", "AmitAnnotation"))
+
+Idents(pseudoFibs) <- "amitAnnotation"
+DefaultAssay(pseudoFibs) <- "RNA"
+
+```
+
+```{r get_gene_sets}
+
+read_all_sheets = function(xlsxFile, ...) {
+  sheet_names = openxlsx::getSheetNames(xlsxFile)
+  sheet_list = as.list(rep(NA, length(sheet_names)))
+  names(sheet_list) = sheet_names
+  for (sn in sheet_names) {
+    sheet_list[[sn]] = openxlsx::read.xlsx(xlsxFile, sheet=sn, colNames = FALSE,...)
+  }
+  return(sheet_list)
+}
+
+supFBGeneSets <- read_all_sheets("/Users/hdeberg/Box/P253_PeterM_Campbell_Keratinocytes_Fibroblasts/tables/SupStimulatedFBGeneSets.xlsx")
+
+```
+
+```{r calc_genesetscores}
+
+geneSetHeatmapScores <- function(geneSetObj,
+                           countsObj){
+  
+  selectedGeneSets <- names(geneSetObj)
+  selectedGenes <- geneSetObj[selectedGeneSets] 
+  
+  #countsObj <- log2(countsObj+1)
+  
+  #Get the mean gene set score for all libs 
+  
+  scoreMatrix <- matrix(data=NA, 
+                        nrow=length(selectedGeneSets), 
+                        ncol=ncol(countsObj))
+  
+  for(i in 1:length(selectedGeneSets)){
+    
+      setGenes <- geneSetObj[[selectedGeneSets[i]]]
+      setGenes <- setGenes[!is.na(setGenes)]
+      setGenes <- setGenes[setGenes != ""]
+      setGenes <- setGenes[setGenes %in% rownames(countsObj)]
+        
+      countsObjSubset <- countsObj[setGenes,]
+    
+      #setScores <- apply(countsObjSubset, 2, function(x) exp(mean(log(x))))
+      setScores <- apply(countsObjSubset, 2, function(x) mean(x))
+      
+      scoreMatrix[i,] <- t(setScores)
+    
+  }
+  
+  rownames(scoreMatrix) <- selectedGeneSets
+  colnames(scoreMatrix) <- colnames(countsObj)
+    
+  return(scoreMatrix)
+}
+
+```
+
+```{r gene_set_scores_in_pseudobulk}
+
+scoreMatrixSupFB <- geneSetHeatmapScores(supFBGeneSets,
+                    pseudoFibs@assays$RNA$data)
+
+```
+
+
+```{r score_heatmap}
+
+topAnno <- HeatmapAnnotation(Group = pseudoFibs$Group,
+                             Anno = str_replace_all(pseudoFibs$AmitAnnotation, "-", "_"),
+                             col = list(Group = groupSubColors,
+                                        Anno = cellTypeColors))
+
+
+hmapSupFBForR01 <- Heatmap(scoreMatrixSupFB,
+                           col= rcartocolor::carto_pal(10, "ag_Sunset"),
+        name = "Gene set score",
+        top_annotation = topAnno,
+        show_column_names = F) 
+
+pdf(file.path(plotDir, "Heatmap_AmitSSc_FBSupScores.pdf"), width = 10, height = 8)
+
+draw(hmapSupFBForR01)
+
+invisible(dev.off())
+```
+
+```{r gene_set_score_dotplots}
+
+pseudoFibs$skinCD103Pos <- scoreMatrixSupFB["Skin CD4+ CD103+",]
+
+gBoxplotScores <- pseudoFibs@meta.data %>%
+  dplyr::filter(AmitAnnotation %in% c("Fibro-LGR5",
+                                      "Fibro-MYOC2")) %>%
+  ggplot(aes(x = AmitAnnotation,
+             y = skinCD103Pos,
+             group = interaction(AmitAnnotation, Group))) +
+  geom_boxplot(color= "black", 
+               outlier.shape = NA) +
+  geom_quasirandom(aes(color = Group),
+                   size = 1,
+                   dodge.width = 0.8,
+                   width = 0.1) +
+  scale_color_manual(values = groupSubColors) +
+  labs(x = "",
+       y = "Skin CD4+ CD103+\ngene set score") +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1),
+        axis.text=element_text(size=14),
+            axis.title=element_text(size=14),
+        legend.text = element_text(size = 14))
+
+pdf(file.path(plotDir, "Boxplot_AmitSSc_LGR5_MYOC2_scores.pdf"), width = 6, height = 4)
+
+print(gBoxplotScores)
+
+invisible(dev.off())
+```
+
+```{r average_gene_set_scores}
+
+scoreMatrixSupFBWithDonor <- scoreMatrixSupFB %>% t() %>%
+  as.data.frame()
+scoreMatrixSupFBWithDonor$patientID <- pseudoFibs$patientID
+scoreMatrixSupFBWithDonor$Group <- pseudoFibs$Group
+scoreMatrixSupFBWithDonor$AmitAnnotation <- pseudoFibs$AmitAnnotation
+
+scoreAvg <- pseudoFibsFibs@meta.data %>%
+  dplyr::group_by(AmitAnnotation) %>%
+  dplyr::summarise(across(names(supFBGeneSets), mean, na.rm = TRUE)) %>%
+  as.data.frame()
+
+rownames(scoreAvg) <- scoreAvg$AmitAnnotation
+scoreAvg$AmitAnnotation <- NULL
+
+scaledScoreAvg <- t(scale(scoreAvg))
+
+
+
+Heatmap(scaledScoreAvg,
+        col = rcartocolor::carto_pal(10, "ag_Sunset"),
+        name = "Gene set score",
+        show_column_names = T) 
+
+```
+
+```{r pseudobulk}
+library(edgeR)
+library(limma)
+
+clusterAverages <- AggregateExpression(seuratFibs, 
+                                    assays = "RNA",
+                                    #features = supGenes,
+                                    group.by = c("AmitAnnotation"),
+                                    return.seurat = T) 
+aggDesign <- clusterAverages@meta.data
+
+clusterCountsFibs<- clusterAverages@assays$RNA$data %>% as.matrix()
+
+#Normalize using the TMM algorithm 
+dgeFibs <- DGEList(clusterCountsFibs)
+dgeFibs <- calcNormFactors(dgeFibs)
+normCountsFibs <- cpm(dgeFibs, normalized.lib.sizes=TRUE)
+
+```
+
+```{r calc_genesetscores}
+
+geneSetHeatmapScores <- function(geneSetObj,
+                           countsObj){
+  
+  selectedGeneSets <- names(geneSetObj)
+  selectedGenes <- geneSetObj[selectedGeneSets] 
+  
+  countsObj <- log2(countsObj+1)
+  
+  #Get the mean gene set score for all libs 
+  
+  scoreMatrix <- matrix(data=NA, 
+                        nrow=length(selectedGeneSets), 
+                        ncol=ncol(countsObj))
+  
+  for(i in 1:length(selectedGeneSets)){
+    
+      setGenes <- geneSetObj[[selectedGeneSets[i]]]
+      setGenes <- setGenes[!is.na(setGenes)]
+      setGenes <- setGenes[setGenes != ""]
+      setGenes <- setGenes[setGenes %in% rownames(countsObj)]
+        
+      countsObjSubset <- countsObj[setGenes,]
+    
+      #setScores <- apply(countsObjSubset, 2, function(x) exp(mean(log(x))))
+      setScores <- apply(countsObjSubset, 2, function(x) mean(x))
+      #setScores <- apply(countsObjSubset, 2, function(x) median(x))
+      scoreMatrix[i,] <- t(setScores)
+    
+  }
+  
+  rownames(scoreMatrix) <- selectedGeneSets
+  colnames(scoreMatrix) <- colnames(countsObj)
+    
+  return(scoreMatrix)
+}
+
+```
+
+```{r compute_scores_cluster}
+
+aggMetadataFibs <- data.frame("name" = colnames(normCountsFibs),
+                          "sample" = str_extract(colnames(normCountsFibs), "[:alnum:]+$"),
+                          "sample2" = str_extract(colnames(normCountsFibs), "GVHD_[:alnum:]+$"),
+                          "sample3" = str_extract(colnames(normCountsFibs), "Morphea_[:alnum:]+$"),
+                          "cluster.name" = str_extract(colnames(normCountsFibs), "^[:alnum:]+_[:alnum:]+"))
+
+aggMetadataFibs$sample <- coalesce(aggMetadataFibs$sample3,
+                                   aggMetadataFibs$sample2,
+                                   aggMetadataFibs$sample)
+aggMetadataFibs$tissue <- seuratFibs$Group[match(aggMetadataFibs$sample, seuratFibs$patientID)]
+
+aggMetadataFibs$cluster.name[str_detect(aggMetadataFibs$name, "Fibro_POSTN_PTGDS")] <- "Fibro_POSTN_PTGDS"
+
+scoreMatrixSupFB <- geneSetHeatmapScores(supFBGeneSets,
+                     normCountsFibs)
+
+aggDesign$AmitAnnotation <- str_replace_all(aggDesign$AmitAnnotation, "-", "_")
+
+topAnno <- HeatmapAnnotation(Subset = aggDesign$AmitAnnotation,
+                             col = list(Subset = cellTypeColors))
+
+scaledScoreMatrixSupFB <- t(scale(t(scoreMatrixSupFB)))
+
+
+hmapSupFBForR01 <- Heatmap(scoreMatrixSupFB,
+                           col= rcartocolor::carto_pal(10, "ag_Sunset"),
+        name = "Gene set score",
+        top_annotation = topAnno,
+        show_column_names = T) 
+
+draw(hmapSupFBForR01)
+
+
+pdf(file.path(plotDir, "Heatmap_AmitSSc_GeneSetScoresByCluster.pdf"), width = 10, height = 5)
+
+draw(hmapSupFBForR01)
+
+invisible(dev.off())
+```
+
+```{r pseudobulk_by_patient}
+clusterAverages <- AggregateExpression(seuratFibs, 
+                                    assays = "RNA",
+                                    #features = supGenes,
+                                    group.by = c("AmitAnnotation", "patientID", "Group"),
+                                    return.seurat = T) 
+aggDesign <- clusterAverages@meta.data
+
+clusterCountsFibs<- clusterAverages@assays$RNA$data %>% as.matrix()
+
+#Normalize using the TMM algorithm 
+dgeFibs <- DGEList(clusterCountsFibs)
+dgeFibs <- calcNormFactors(dgeFibs)
+normCountsFibs <- cpm(dgeFibs, normalized.lib.sizes=TRUE)
+
+```
+
+
+```{r compute_scores_cluster}
+
+aggMetadataFibs <- data.frame("name" = colnames(normCountsFibs),
+                          "sample" = str_extract(colnames(normCountsFibs), "[:alnum:]+$"),
+                          "sample2" = str_extract(colnames(normCountsFibs), "GVHD_[:alnum:]+$"),
+                          "sample3" = str_extract(colnames(normCountsFibs), "Morphea_[:alnum:]+$"),
+                          "cluster.name" = str_extract(colnames(normCountsFibs), "^[:alnum:]+_[:alnum:]+"))
+
+aggMetadataFibs$sample <- coalesce(aggMetadataFibs$sample3,
+                                   aggMetadataFibs$sample2,
+                                   aggMetadataFibs$sample)
+aggMetadataFibs$tissue <- seuratFibs$Group[match(aggMetadataFibs$sample, seuratFibs$patientID)]
+
+aggMetadataFibs$cluster.name[str_detect(aggMetadataFibs$name, "Fibro_POSTN_PTGDS")] <- "Fibro_POSTN_PTGDS"
+
+scoreMatrixSupFB <- geneSetHeatmapScores(supFBGeneSets,
+                     normCountsFibs)
+
+aggDesign$AmitAnnotation <- str_replace_all(aggDesign$AmitAnnotation, "-", "_")
+
+
+scoresSupFB <- scoreMatrixSupFB %>% t() %>% as.data.frame()
+scoresSupFB$name <- rownames(scoresSupFB)
+
+annoSupScores <- cbind(aggDesign, scoresSupFB)
+
+supGroups <- annoSupScores %>%
+  pivot_longer(cols = c("Blood CD4+ Th1",
+                        "Blood CD4+ Th2",
+                        "Blood CD4+ Th17",
+                        "Blood CD4+ Th22",
+                        "Blood CD4+ CD103+",
+                        "Skin CD4+ CD103-",
+                        "Skin CD4+ CD103+"),
+               names_to = "sup",
+               values_to = "score")
+
+gSelSup <- supGroups %>%
+    dplyr::filter(Group %in% c("Control", "DSSC")) %>%
+  dplyr::filter(AmitAnnotation %in% c("Fibro_LGR5", "Fibro_MYOC2"),
+                sup %in% c("Skin CD4+ CD103+")) %>%
+ggplot(aes(x = AmitAnnotation,
+             y = score,
+           #shape = Group,
+           color = Group,
+           group = interaction(AmitAnnotation, Group))) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_quasirandom(dodge.width = 0.8,
+                   width = 0.2)+
+  #scale_shape_manual(values = c(1,19))+
+  scale_color_manual(values = groupSubColors)+
+  labs(x = "",
+       y = "Gene set score") +
+  ylim(c(0,7)) +
+   theme(axis.text=element_text(size=14),
+            axis.title=element_text(size=14),
+         axis.text.x = element_text(angle = 45, vjust = 1, hjust=1)) 
+  facet_wrap(~sup)
+
+pdf(file.path(plotDir, 
+              "Boxplot_AmitSScLGR5_MYOC2_SkinCD103.pdf"),
+    height = 4,
+    width = 5)
+
+print(gSelSup)
+
+invisible(dev.off())
+
+
+supStats <- supGroups %>%
+    dplyr::filter(Group %in% c("Control", "DSSC")) %>%
+  dplyr::filter(AmitAnnotation %in% c("Fibro_LGR5", "Fibro_MYOC2"),
+                sup %in% c("Skin CD4+ CD103+")) %>%
+  dplyr::group_by(sup, AmitAnnotation) %>%
+  rstatix::t_test(score ~ Group) %>%
+  dplyr::ungroup() %>%
+  dplyr::mutate(pAdj = p.adjust(p, method = "bonferroni"))
+
+```
+
+```{r use_seurat_gene_set_scores}
+
+test <- list(supFBGeneSets$`Blood CD4+ Th1`$X1,
+                      supFBGeneSets$`Blood CD4+ Th2`$X1,
+                      supFBGeneSets$`Blood CD4+ Th17`$X1,
+                      supFBGeneSets$`Blood CD4+ Th22`$X1,
+                      supFBGeneSets$`Blood CD4+ CD103+`$X1,
+                      supFBGeneSets$`Skin CD4+ CD103-`$X1,
+                      supFBGeneSets$`Skin CD4+ CD103+`$X1)
+
+seuratFibs <- AddModuleScore(seuratFibs, 
+                             features = test, 
+                             name = "FB_Score")
+
+#Rename scores to have the same names as the list gene sets
+
+seuratFibs@meta.data <- seuratFibs@meta.data %>%
+  dplyr::rename_at(vars(paste0("FB_Score", seq(1,length(supFBGeneSets)))), ~ names(supFBGeneSets))
+```
+
+```{r average_gene_set_scores}
+
+scoreAvg <- seuratFibs@meta.data %>%
+  dplyr::group_by(AmitAnnotation) %>%
+  dplyr::summarise(across(names(supFBGeneSets), mean, na.rm = TRUE)) %>%
+  as.data.frame()
+
+rownames(scoreAvg) <- scoreAvg$AmitAnnotation
+scoreAvg$AmitAnnotation <- NULL
+
+scaledScoreAvg <- t(scale(scoreAvg))
+
+
+
+Heatmap(scaledScoreAvg,
+        col = rcartocolor::carto_pal(10, "ag_Sunset"),
+        name = "Gene set score",
+        show_column_names = T) 
+
+```
+
+```{AUCell}
+
+library(AUCell)
+
+test <- list(Th1 = supFBGeneSets$`Blood CD4+ Th1`$X1,
+              Th2 =        supFBGeneSets$`Blood CD4+ Th2`$X1,
+               Th17 =        supFBGeneSets$`Blood CD4+ Th17`$X1,
+               Th22 =        supFBGeneSets$`Blood CD4+ Th22`$X1,
+               BloodCD103pos =       supFBGeneSets$`Blood CD4+ CD103+`$X1,
+                SkinCD103neg =      supFBGeneSets$`Skin CD4+ CD103-`$X1,
+                  SkinCD103Pos =   supFBGeneSets$`Skin CD4+ CD103+`$X1)
+
+counts <- GetAssayData(object = seuratFibs, slot = "counts")
+
+cellsRankings <- AUCell_buildRankings(counts)
+cellsAUC <- AUCell_calcAUC(test, cellsRankings)
+
+seuratFibs$Th1 <- cellsAUC@assays@data$AUC[1,]
+seuratFibs$Th2 <- cellsAUC@assays@data$AUC[2,]
+seuratFibs$Th17 <- cellsAUC@assays@data$AUC[3,]
+seuratFibs$Th22 <- cellsAUC@assays@data$AUC[4,]
+seuratFibs$BloodCD103pos <- cellsAUC@assays@data$AUC[5,]
+seuratFibs$SkinCD103neg <- cellsAUC@assays@data$AUC[6,]
+seuratFibs$SkinCD103Pos <- cellsAUC@assays@data$AUC[7,]
+
+```
+
+```{r plot_gene_set_scores}
+
+scoreAvg <- seuratFibs@meta.data %>%
+  dplyr::group_by(AmitAnnotation) %>%
+  dplyr::summarise(across(names(test), mean, na.rm = TRUE)) %>%
+  as.data.frame()
+
+rownames(scoreAvg) <- scoreAvg$AmitAnnotation
+scoreAvg$AmitAnnotation <- NULL
+
+
+Heatmap(t(scoreAvg),
+        col = rcartocolor::carto_pal(10, "ag_Sunset"),
+        name = "Gene set score",
+        show_column_names = T) 
+
+scoreAvgByDonor <- seuratFibs@meta.data %>%
+  dplyr::group_by(AmitAnnotation, patientID, Group) %>%
+  dplyr::summarise(across(names(test), mean, na.rm = TRUE)) %>%
+  as.data.frame() 
+
+scoreAvgByDonor %>%
+dplyr::filter(Group %in% c("Control", "DSSC")) %>%
+  dplyr::filter(AmitAnnotation %in% c("Fibro_LGR5", "Fibro_MYOC2")) %>%
+ggplot(aes(x = AmitAnnotation,
+             y = SkinCD103Pos,
+           #shape = Group,
+           color = Group,
+           group = interaction(AmitAnnotation, Group))) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_quasirandom(dodge.width = 0.8,
+                   width = 0.2)+
+  #scale_shape_manual(values = c(1,19))+
+  scale_color_manual(values = groupSubColors)+
+  labs(x = "",
+       y = "Gene set score") +
+  #ylim(c(0,7)) +
+   theme(axis.text=element_text(size=14),
+            axis.title=element_text(size=14),
+         axis.text.x = element_text(angle = 45, vjust = 1, hjust=1)) 
+  facet_wrap(~sup)
+
+pdf(file.path(plotDir, 
+              "Boxplot_AmitSScLGR5_MYOC2_SkinCD103.pdf"),
+    height = 4,
+    width = 5)
+
+print(gSelSup)
+
+invisible(dev.off())
+
+
+supStats <- supGroups %>%
+    dplyr::filter(Group %in% c("Control", "DSSC")) %>%
+  dplyr::filter(AmitAnnotation %in% c("Fibro_LGR5", "Fibro_MYOC2"),
+                sup %in% c("Skin CD4+ CD103+")) %>%
+  dplyr::group_by(sup, AmitAnnotation) %>%
+  rstatix::t_test(score ~ Group) %>%
+  dplyr::ungroup() %>%
+  dplyr::mutate(pAdj = p.adjust(p, method = "bonferroni"))
+
+```
+
+
+
+
+
