@@ -60,7 +60,7 @@ plotDir <- file.path(baseDir, "plots")
 tableDir <- file.path(baseDir, "tables")
 dataDir <- file.path(baseDir, "data")
 geoDataDir <- file.path(baseDir, "geoData", "GSE195452_RAW")
-
+manuscriptTableDir <- "/Users/hdeberg/Box/P253_PeterM_Campbell_Keratinocytes_Fibroblasts/manuscript/dataTables"
 ```
 
 ```{r set_colors}
@@ -274,6 +274,112 @@ invisible(dev.off())
 
 ```
 
+```{r proportion_data_tables}
+
+fig6CTable <- donorFibCounts %>%
+  dplyr::filter(AmitAnnotation == "Fibro_LGR5") %>%
+  dplyr::select(patientID, Group, propCells) %>%
+  dplyr::rename(`Fraction of cells` = propCells) 
+
+write.csv(fig6CTable, file.path(manuscriptTableDir, "Fig6C_FibroLGR5Proportions.csv"), row.names = FALSE)
+
+figS8ATable <- donorFibCounts %>%
+  dplyr::filter(AmitAnnotation == "Fibro_LGR5" | AmitAnnotation == "Fibro_MYOC2") %>%
+  dplyr::select(patientID, Group, AmitAnnotation, propCells) %>%
+  dplyr::rename(`Fraction of cells` = propCells,
+                `Cell type` = AmitAnnotation)
+
+write.csv(figS8ATable, file.path(manuscriptTableDir, "FigS8A_FibroProportions.csv"), row.names = FALSE)
+
+```
+
+```{r proportions_hmap}
+
+#Add mRSS to the proportions data
+
+hmapData <- donorFibCounts %>%
+  dplyr::mutate(propCells = propCells*100) %>%
+  pivot_wider(id_cols = c("patientID",
+                          "Group",
+                          "Autoantibody_Cat",
+                          "Skin_Score"),
+              names_from = AmitAnnotation,
+              values_from = propCells) %>%
+  dplyr::arrange(Fibro_LGR5) 
+
+autoAbColors <- rcartocolor::carto_pal(length(unique(donorFibCounts$Autoantibody_Cat)), 
+                                       "Vivid")
+
+names(autoAbColors) <- unique(donorFibCounts$Autoantibody_Cat)
+
+colAnno <- HeatmapAnnotation(Group = hmapData$Group,
+                             AutoantibodyCategory = hmapData$Autoantibody_Cat,
+                             SkinScore = hmapData$Skin_Score,
+                             col = list(Group = groupSubColors,
+                                        AutoantibodyCategory = autoAbColors))
+
+hmapDataAnno <- hmapData %>%
+  dplyr::select(patientID, Group, Autoantibody_Cat, Skin_Score) 
+
+hmapData <- hmapData %>%
+  dplyr::select(-patientID, -Group, -Autoantibody_Cat, -Skin_Score) %>%
+  dplyr::select(Fibro_LGR5, everything()) %>%
+  as.matrix() %>%
+  t()
+
+hmapColors <- circlize::colorRamp2(seq(0,70,10), viridis(8, option = "plasma"))
+
+Heatmap(hmapData, 
+        col = hmapColors,
+        name = "% of fibroblasts",
+        cluster_columns = TRUE,
+        show_column_dend = TRUE,
+        column_dend_height = unit(0.5, "cm"),
+        cluster_rows = TRUE,
+        show_row_dend = TRUE,
+        top_annotation = colAnno,
+        show_row_names = TRUE,
+        show_column_names = FALSE)
+
+pdf(file.path(plotDir, 
+              "HeatmapFibroblastPercentages.pdf"),
+    height = 4,
+    width = 8)
+
+Heatmap(hmapData, 
+        col = hmapColors,
+        name = "% of fibroblasts",
+        cluster_columns = TRUE,
+        show_column_dend = TRUE,
+        column_dend_height = unit(0.5, "cm"),
+        cluster_rows = TRUE,
+        show_row_dend = TRUE,
+        top_annotation = colAnno,
+        show_row_names = TRUE,
+        show_column_names = FALSE)
+
+invisible(dev.off())
+
+
+```
+
+```{r data_table_for_heatmap_fib_percentages}
+
+figS8CTable <- hmapData %>% t() %>% as.data.frame()
+figS8CTable$AutoAbCategory <- hmapDataAnno$Autoantibody_Cat
+figS8CTable$SkinScore <- hmapDataAnno$Skin_Score
+figS8CTable$patientID <- hmapDataAnno$patientID
+
+figS8CTable <- figS8CTable %>%
+  dplyr::select(`patientID`,`AutoAbCategory`,`SkinScore`, everything())
+
+write.csv(figS8CTable, file.path(manuscriptTableDir, "FigS8C_PercentHeatmap.csv"), row.names = FALSE)
+
+
+
+```
+
+
 ```{r pseudobulk}
 
 pseudoFibs <- AggregateExpression(seuratFibs, 
@@ -410,7 +516,7 @@ scoreMatrixSupFBWithDonor$patientID <- pseudoFibs$patientID
 scoreMatrixSupFBWithDonor$Group <- pseudoFibs$Group
 scoreMatrixSupFBWithDonor$AmitAnnotation <- pseudoFibs$AmitAnnotation
 
-scoreAvg <- pseudoFibsFibs@meta.data %>%
+scoreAvg <- pseudoFibs@meta.data %>%
   dplyr::group_by(AmitAnnotation) %>%
   dplyr::summarise(across(names(supFBGeneSets), mean, na.rm = TRUE)) %>%
   as.data.frame()
@@ -529,6 +635,19 @@ pdf(file.path(plotDir, "Heatmap_AmitSSc_GeneSetScoresByCluster.pdf"), width = 10
 draw(hmapSupFBForR01)
 
 invisible(dev.off())
+```
+
+```{r heatmap_data_table}
+
+fig6DTable <- scoreMatrixSupFB %>% t() %>% as.data.frame()
+fig6DTable$`Group` <- aggDesign$AmitAnnotation
+
+fig6DTable <- fig6DTable %>%
+  dplyr::select(`Group`, everything())
+
+write.csv(fig6DTable, file.path(manuscriptTableDir, "Fig6CRevised_AggregatedHeatmap.csv"), row.names = FALSE)
+
+
 ```
 
 ```{r pseudobulk_by_patient}
@@ -759,6 +878,21 @@ supStats <- supGroups %>%
   dplyr::mutate(pAdj = p.adjust(p, method = "bonferroni"))
 
 ```
+
+```{r gene_set_data_table}
+
+fig6ETable <- scoreAvgByDonor %>%
+dplyr::filter(Group %in% c("Control", "DSSC")) %>%
+  dplyr::filter(AmitAnnotation %in% c("Fibro_LGR5", "Fibro_MYOC2")) %>%
+  dplyr::select(patientID, Group, AmitAnnotation, SkinCD103Pos) %>%
+  dplyr::rename(`Skin CD103+ gene set score` = SkinCD103Pos,
+                `Cell type` = AmitAnnotation)
+
+write.csv(fig6ETable, file.path(manuscriptTableDir, "Fig6E_FibroLGR5_MYOC2_SkinCD103Pos.csv"), row.names = FALSE)
+
+```
+
+
 
 
 

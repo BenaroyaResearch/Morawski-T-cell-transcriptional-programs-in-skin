@@ -88,6 +88,7 @@ base_dir <- "/Users/hdeberg/Box/P253_PeterM_Campbell_Keratinocytes_Fibroblasts"
 data_dir <- file.path(base_dir, "data")
 plots_dir <- file.path(base_dir, "plots")
 tables_dir <- file.path(base_dir, "tables")
+manuscriptTableDir <- file.path(base_dir, "manuscript", "dataTables")
 
 ```
 
@@ -857,6 +858,42 @@ invisible(dev.off())
 
 ```
 
+```{r cytokine_plot_tables}
+
+# Make values of the cytokine data in table form
+
+fig1CCytokines <- c("IFNGamma", "IL4", "IL5", "IL13", "IL17a", "IL17f", "IL22", "TNFAlpha")
+
+
+fig1CTable <- cytokineSummary %>%
+  dplyr::filter(cytokine %in% fig1CCytokines) %>%
+  dplyr::select(subjectIDUnique, cytokine, stimSort, value) %>%
+  pivot_wider(names_from = "cytokine",
+              values_from = "value") %>%
+  dplyr::rename(subjectID = subjectIDUnique,
+                `T cell population` = stimSort) %>%
+  dplyr::mutate(subjectID = case_when(subjectID == "Control" ~ "Control_0",
+                   TRUE ~ subjectID)) %>%
+  dplyr::filter(!is.na(IL5))
+
+figS1Cytokines <- c("GMCSF", "IL10", "IL2", "IL6", "IL9")
+
+figS1Table <- cytokineSummary %>%
+  dplyr::filter(cytokine %in% figS1Cytokines) %>%
+  dplyr::select(subjectIDUnique, cytokine, stimSort, value) %>%
+  pivot_wider(names_from = "cytokine",
+              values_from = "value") %>%
+  dplyr::rename(subjectID = subjectIDUnique,
+                `T cell population` = stimSort) %>%
+  dplyr::mutate(subjectID = case_when(subjectID == "Control" ~ "Control_0",
+                   TRUE ~ subjectID)) %>%
+  dplyr::filter(!is.na(IL10))
+
+write.csv(fig1CTable, file.path(manuscriptTableDir, "Fig1C_CytokineAssayData.csv"), quote=FALSE, row.names = FALSE)
+write.csv(figS1Table, file.path(manuscriptTableDir, "FigS1_CytokineAssayData.csv"), quote=FALSE, row.names = FALSE)
+
+```
+
 ```{r cytokine_statistics}
 
 
@@ -984,6 +1021,22 @@ make_pca_plots(pdatscoresFib,
 
 ```
 
+```{r fib_pca_data_tables}
+
+fig3ATable <- pdatscoresFib %>%
+  dplyr::select(libid, stimSort, PC1, PC2) %>%
+  dplyr::rename(`Library ID` = libid,
+                `T cell population` = stimSort)
+
+fig3BTable <- pdatscoresFib %>%
+  dplyr::select(libid, subjectID, PC1, PC2) %>%
+  dplyr::rename(`Library ID` = libid)
+
+write.csv(fig3ATable, file.path(manuscriptTableDir, "Fig3A_FibroblastPCAScores.csv"), quote=FALSE, row.names = FALSE)
+write.csv(fig3BTable, file.path(manuscriptTableDir, "Fig3B_FibroblastPCAScores.csv"), quote=FALSE, row.names = FALSE)
+
+```
+
 ## Keratinocytes
 
 ```{r pca_ker}
@@ -1007,6 +1060,22 @@ make_pca_plots(pdatscoresKer,
                xLabString = pc1LabKer,
                yLabString = pc2LabKer,
                filename_prefix = "PCAKeratinocytes")
+
+```
+
+```{r ker_pca_data_tables}
+
+fig2ATable <- pdatscoresKer %>%
+  dplyr::select(libid, stimSort, PC1, PC2) %>%
+  dplyr::rename(`Library ID` = libid,
+                `T cell population` = stimSort)
+
+fig2BTable <- pdatscoresKer %>%
+  dplyr::select(libid, subjectID, PC1, PC2) %>%
+  dplyr::rename(`Library ID` = libid)
+
+write.csv(fig2ATable, file.path(manuscriptTableDir, "Fig2A_KeratinocytePCAScores.csv"), quote=FALSE, row.names = FALSE)
+write.csv(fig2BTable, file.path(manuscriptTableDir, "Fig2B_KeratinocytePCAScores.csv"), quote=FALSE, row.names = FALSE)
 
 ```
 
@@ -1191,6 +1260,29 @@ plot_many_genes <- function(genes,
 
 plot_many_genes(receptorGenes, countsFib, designFib, cellType = "FB", save_plot = TRUE, log_scale = TRUE)
 plot_many_genes(receptorGenes, countsKer, designKer, cellType = "KC", save_plot = TRUE, log_scale = TRUE)
+
+```
+
+```{r write_receptor_data_tables}
+
+tableS5 <- designFib %>%
+  dplyr::select(libid, subjectID, stimSort) %>%
+  dplyr::rename(`Library ID` = libid,
+                `T cell population` = stimSort)
+
+tableS5 <- cbind(tableS5, t(log2(countsFib[receptorGenes,]+1)))
+
+write.csv(tableS5, file.path(manuscriptTableDir, "FigS5_FibroblastCytokineReceptorGeneExpression.csv"), quote=FALSE, row.names = FALSE)
+
+
+tableS3 <- designKer %>%
+  dplyr::select(libid, subjectID, stimSort) %>%
+  dplyr::rename(`Library ID` = libid,
+                `T cell population` = stimSort)
+
+tableS3 <- cbind(tableS3, t(log2(countsKer[receptorGenes,]+1)))
+
+write.csv(tableS3, file.path(manuscriptTableDir, "FigS3_KeratinocyteCytokineReceptorGeneExpression.csv"), quote=FALSE, row.names = FALSE)
 
 ```
 
@@ -1633,6 +1725,54 @@ ggpubr::ggarrange(gBloodCD4CD103pos,
 invisible(dev.off())
 ```
 
+```{r ker_volcano_data_table}
+
+
+th1MatchIdx <- match(rownames(topGenesBloodCD4CD103posVAllCD4sKer),
+                     rownames(topGenesBloodCD4Th1VAllCD4sKer))
+
+
+th2MatchIdx <- match(rownames(topGenesBloodCD4CD103posVAllCD4sKer),
+                     rownames(topGenesBloodCD4Th2VAllCD4sKer))
+
+
+th17MatchIdx <- match(rownames(topGenesBloodCD4CD103posVAllCD4sKer),
+                     rownames(topGenesBloodCD4Th17VAllCD4sKer))
+
+
+th22MatchIdx <- match(rownames(topGenesBloodCD4CD103posVAllCD4sKer),
+                     rownames(topGenesBloodCD4Th22VAllCD4sKer))
+
+
+skinCD103negMatchIdx <- match(rownames(topGenesBloodCD4CD103posVAllCD4sKer),
+                     rownames(topGenesSkinCD4CD103negVAllCD4sKer))
+
+skinCD103posMatchIdx <- match(rownames(topGenesBloodCD4CD103posVAllCD4sKer),
+                     rownames(topGenesSkinCD4CD103posVAllCD4sKer))
+
+figS2Table <- data.frame(Gene = rownames(topGenesBloodCD4CD103posVAllCD4sKer),
+                        `Blood CD4posCLAposCD103pos vs Others log2FC` = topGenesBloodCD4CD103posVAllCD4sKer$logFC,
+                        `Blood CD4posCLAposCD103pos vs Others FDR` = topGenesBloodCD4CD103posVAllCD4sKer$adj.P.Val,
+                        `Blood CD4posCLAposTh1 vs Others log2FC` = topGenesBloodCD4Th1VAllCD4sKer$logFC[th1MatchIdx],
+                        `Blood CD4posCLAposTh1 vs Others FDR` = topGenesBloodCD4Th1VAllCD4sKer$adj.P.Val[th1MatchIdx],
+                        `Blood CD4posCLAposTh2 vs Others log2FC` = topGenesBloodCD4Th2VAllCD4sKer$logFC[th2MatchIdx],
+                        `Blood CD4posCLAposTh2 vs Others FDR` = topGenesBloodCD4Th2VAllCD4sKer$adj.P.Val[th2MatchIdx],
+                        `Blood CD4posCLAposTh17 vs Others log2FC` = topGenesBloodCD4Th17VAllCD4sKer$logFC[th17MatchIdx],
+                        `Blood CD4posCLAposTh17 vs Others FDR` = topGenesBloodCD4Th17VAllCD4sKer$adj.P.Val[th17MatchIdx],
+                        `Blood CD4posCLAposTh22 vs Others log2FC` = topGenesBloodCD4Th22VAllCD4sKer$logFC[th22MatchIdx],
+                        `Blood CD4posCLAposTh22 vs Others FDR` = topGenesBloodCD4Th22VAllCD4sKer$adj.P.Val[th22MatchIdx],
+                        `Skin CD4posCLAposCD103neg vs Others log2FC` = topGenesSkinCD4CD103negVAllCD4sKer$logFC[skinCD103negMatchIdx],
+                        `Skin CD4posCLAposCD103neg vs Others FDR` = topGenesSkinCD4CD103negVAllCD4sKer$adj.P.Val[skinCD103negMatchIdx],
+                        `Skin CD4posCLAposCD103pos vs Others log2FC` = topGenesSkinCD4CD103posVAllCD4sKer$logFC[skinCD103posMatchIdx],
+                        `Skin CD4posCLAposCD103pos vs Others FDR` = topGenesSkinCD4CD103posVAllCD4sKer$adj.P.Val[skinCD103posMatchIdx],
+                        check.names=FALSE)
+
+
+write.csv(figS2Table, file.path(manuscriptTableDir, "FigS2_KerVolcanoPlots.csv"), row.names = FALSE)
+
+```
+
+
 ### Heatmap
 
 The following heatmap shows the top 20 differentially expressed genes (20 smallest p-values) for each group compared against other CD4 groups.
@@ -1729,6 +1869,22 @@ print(hmap)
 
 
 invisible(dev.off())
+
+```
+
+```{r table_for_ker_heatmap}
+
+fig2CTable <- scaledCounts %>% t() %>% as.data.frame()
+
+fig2CTable$`T cell population` <- designForHmap$stimSort
+fig2CTable$`Library ID` <- rownames(fig2CTable)
+
+fig2CTable <- fig2CTable %>%
+  dplyr::select(`Library ID`,`T cell population`, everything())
+
+write.csv(fig2CTable, file.path(manuscriptTableDir, "Fig2C_KeratinocyteHeatmap.csv"), row.names = FALSE)
+
+
 
 ```
 
@@ -1833,6 +1989,21 @@ print(hmap_z)
 
 
 invisible(dev.off())
+
+```
+
+```{r table_for_averaged_ker_heatmap}
+
+fig2DTable <- scaledCounts %>% t() %>% as.data.frame()
+
+fig2DTable$`T cell population` <- designAveraged$stimSort
+
+fig2DTable <- fig2DTable %>%
+  dplyr::select(`T cell population`, everything())
+
+write.csv(fig2DTable, file.path(manuscriptTableDir, "Fig2D_AveragedKeratinocyteHeatmap.csv"), row.names = FALSE)
+
+
 
 ```
 
@@ -2009,6 +2180,53 @@ ggpubr::ggarrange(gBloodCD4CD103posFib,
 invisible(dev.off())
 ```
 
+```{r fib_volcano_data_table}
+
+
+th1MatchIdx <- match(rownames(topGenesBloodCD4CD103posVAllCD4sFib),
+                     rownames(topGenesBloodCD4Th1VAllCD4sFib))
+
+
+th2MatchIdx <- match(rownames(topGenesBloodCD4CD103posVAllCD4sFib),
+                     rownames(topGenesBloodCD4Th2VAllCD4sFib))
+
+
+th17MatchIdx <- match(rownames(topGenesBloodCD4CD103posVAllCD4sFib),
+                     rownames(topGenesBloodCD4Th17VAllCD4sFib))
+
+
+th22MatchIdx <- match(rownames(topGenesBloodCD4CD103posVAllCD4sFib),
+                     rownames(topGenesBloodCD4Th22VAllCD4sFib))
+
+
+skinCD103negMatchIdx <- match(rownames(topGenesBloodCD4CD103posVAllCD4sFib),
+                     rownames(topGenesSkinCD4CD103negVAllCD4sFib))
+
+skinCD103posMatchIdx <- match(rownames(topGenesBloodCD4CD103posVAllCD4sFib),
+                     rownames(topGenesSkinCD4CD103posVAllCD4sFib))
+
+figS4Table <- data.frame(Gene = rownames(topGenesBloodCD4CD103posVAllCD4sFib),
+                        `Blood CD4posCLAposCD103pos vs Others log2FC` = topGenesBloodCD4CD103posVAllCD4sFib$logFC,
+                        `Blood CD4posCLAposCD103pos vs Others FDR` = topGenesBloodCD4CD103posVAllCD4sFib$adj.P.Val,
+                        `Blood CD4posCLAposTh1 vs Others log2FC` = topGenesBloodCD4Th1VAllCD4sFib$logFC[th1MatchIdx],
+                        `Blood CD4posCLAposTh1 vs Others FDR` = topGenesBloodCD4Th1VAllCD4sFib$adj.P.Val[th1MatchIdx],
+                        `Blood CD4posCLAposTh2 vs Others log2FC` = topGenesBloodCD4Th2VAllCD4sFib$logFC[th2MatchIdx],
+                        `Blood CD4posCLAposTh2 vs Others FDR` = topGenesBloodCD4Th2VAllCD4sFib$adj.P.Val[th2MatchIdx],
+                        `Blood CD4posCLAposTh17 vs Others log2FC` = topGenesBloodCD4Th17VAllCD4sFib$logFC[th17MatchIdx],
+                        `Blood CD4posCLAposTh17 vs Others FDR` = topGenesBloodCD4Th17VAllCD4sFib$adj.P.Val[th17MatchIdx],
+                        `Blood CD4posCLAposTh22 vs Others log2FC` = topGenesBloodCD4Th22VAllCD4sFib$logFC[th22MatchIdx],
+                        `Blood CD4posCLAposTh22 vs Others FDR` = topGenesBloodCD4Th22VAllCD4sFib$adj.P.Val[th22MatchIdx],
+                        `Skin CD4posCLAposCD103neg vs Others log2FC` = topGenesSkinCD4CD103negVAllCD4sFib$logFC[skinCD103negMatchIdx],
+                        `Skin CD4posCLAposCD103neg vs Others FDR` = topGenesSkinCD4CD103negVAllCD4sFib$adj.P.Val[skinCD103negMatchIdx],
+                        `Skin CD4posCLAposCD103pos vs Others log2FC` = topGenesSkinCD4CD103posVAllCD4sFib$logFC[skinCD103posMatchIdx],
+                        `Skin CD4posCLAposCD103pos vs Others FDR` = topGenesSkinCD4CD103posVAllCD4sFib$adj.P.Val[skinCD103posMatchIdx],
+                        check.names=FALSE)
+
+
+write.csv(figS4Table, file.path(manuscriptTableDir, "FigS4_FibVolcanoPlots.csv"), row.names = FALSE)
+
+```
+
 ###Heatmap
 
 The following heatmap shows the top 20 differentially expressed genes (20 smallest p-values) for each group compared against other CD4 groups.
@@ -2105,6 +2323,22 @@ print(hmap)
 
 
 invisible(dev.off())
+
+```
+
+```{r table_for_fib_heatmap}
+
+fig3CTable <- scaledCounts %>% t() %>% as.data.frame()
+
+fig3CTable$`T cell population` <- designForHmap$stimSort
+fig3CTable$`Library ID` <- rownames(fig3CTable)
+
+fig3CTable <- fig3CTable %>%
+  dplyr::select(`Library ID`,`T cell population`, everything())
+
+write.csv(fig3CTable, file.path(manuscriptTableDir, "Fig3C_FibroblastHeatmap.csv"), row.names = FALSE)
+
+
 
 ```
 
@@ -2212,6 +2446,21 @@ invisible(dev.off())
 
 ```
 
+```{r table_for_averaged_fib_heatmap}
+
+fig3DTable <- scaledCounts %>% t() %>% as.data.frame()
+
+fig3DTable$`T cell population` <- designAveraged$stimSort
+
+fig3DTable <- fig3DTable %>%
+  dplyr::select(`T cell population`, everything())
+
+write.csv(fig3DTable, file.path(manuscriptTableDir, "Fig3D_AveragedKeratinocyteHeatmap.csv"), row.names = FALSE)
+
+
+
+```
+
 # Enrichment
 
 ```{r make_enrichment_plot}
@@ -2236,6 +2485,7 @@ stimSortShapes <- c("Unstimulated" = 17,
 
 enrichedDotPlot <- function(enrichedDF,
                             plotName,
+                            tableName,
                             fracCutoff = 0.10,
                             pCutoff = 1e-6,
                             nTerms = 10,
@@ -2303,6 +2553,18 @@ pdf(file.path(plots_dir, plotName),
 print(cowplot::plot_grid(ggtree_plot, gEnrichmentPlot, nrow = 1, rel_widths = c(0.25,2), align = 'h'))
 
 invisible(dev.off())
+
+enrichedTable <- enrichedDF
+
+enrichedTable <- enrichedTable %>%
+  dplyr::select(Term, comparison, `P.value`) %>%
+  dplyr::rename(`T cell population` = comparison,
+                `Adjusted P value` = `P.value`,
+                `Pathway` = Term) 
+
+write.csv(enrichedTable, 
+          file.path(manuscriptTableDir, tableName),
+          row.names = FALSE)
 
 return(gEnrichmentPlot)
 
@@ -2407,6 +2669,7 @@ enrichedSupKerVAllCD4s <- flattenList(enrichedSupKerVAllCD4s)
 
 enrichedDotPlot(enrichedSupKerVAllCD4s,
                 "enrichmentPValuePlot_SupKer.pdf",
+                "Fig2E_KeratinocyteEnrichmentPlot.csv",
                 figureHeight = 6,
                 figureWidth = 10)
 
@@ -2452,6 +2715,7 @@ enrichedSupFibVAllCD4s <- flattenList(enrichedSupFibVAllCD4s)
 
 enrichedDotPlot(enrichedSupFibVAllCD4s,
                 "enrichmentPValuePlot_SupFib.pdf",
+                "Fig3E_KeratinocyteEnrichmentPlot.csv",
                 figureHeight = 4,
                 figureWidth = 6)
 
@@ -2469,3 +2733,5 @@ design %>%
   dplyr::summarise(nDonors = length(unique(subjectID))) 
 
 ```
+
+
