@@ -1,0 +1,966 @@
+---
+title: "Single cell psoriasis analysis"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    number_sections: true
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, echo=FALSE, message=FALSE, warning=FALSE}
+library(knitr)
+library(dplyr)
+library(ggplot2); theme_set(
+  theme_bw(20) +
+    theme(panel.grid.major = element_blank(),
+          panel.grid.minor = element_blank(),
+          panel.border = element_rect(colour="black", fill=NA, size=1),
+          axis.text=element_text(colour="black"),
+          axis.ticks=element_line(colour="black"),
+          legend.key = element_blank(),
+           text = element_text(size=20),
+          strip.text.x = element_text(size = 14,margin = margin( b = 2, t = 2) ),
+            strip.background = element_rect(fill="white", colour="black")))
+
+library(ggthemes)
+library(ggbeeswarm)
+library(viridis)
+library(stringr)
+library(readxl)
+library(kableExtra)
+library(RColorBrewer)
+library(plotly)
+library(tidyr)
+library(gtools)
+library(data.table)
+#library(edgeR)
+library(hdf5r)
+library(ggrepel)
+library(ComplexHeatmap)
+library(egg) #For ggarrange
+#library(ggpubr) #Also for ggarrange
+library(umap)
+library(igraph)
+library(forcats)
+library(Seurat)
+library(randomcoloR)
+library(rcartocolor) 
+library(GEOquery)
+library(biomaRt)
+
+opts_chunk$set(fig.width=6, fig.height=4.0, cache = TRUE, echo=FALSE, warning=FALSE, message=FALSE, cache.lazy = FALSE, results='hide')
+opts_knit$set(root.dir = "/Users/hdeberg/Box/P253_PeterM_Campbell_Keratinocytes_Fibroblasts")
+
+options(stringsAsFactors = FALSE)
+
+options(future.globals.maxSize= 1591289600)
+
+
+```
+
+```{r set_up_directories, cache = TRUE}
+
+baseDir <- "/Users/hdeberg/Box/P253_PeterM_Campbell_Keratinocytes_Fibroblasts"
+dataDir <- file.path(baseDir, "data", "GEODatasets", "GSE228421_RAW")
+processedDataDir <- file.path(baseDir, "data", "GEODatasets", "GSE228421Seurat")
+plotDir <- file.path(baseDir, "plots")
+tableDir <- file.path(baseDir, "tables")
+geneSetDir <- file.path(baseDir, "gene_sets")
+manuscriptTableDir <- "/Users/hdeberg/Box/P253_PeterM_Campbell_Keratinocytes_Fibroblasts/manuscript/dataTables"
+
+```
+
+```{r get_geo_metadata}
+
+Sys.setenv("VROOM_CONNECTION_SIZE" = 131072 * 8)
+
+gdsGSE228421 <- getGEO("GSE228421")
+GSE228421Anno <- gdsGSE228421$GSE228421_series_matrix.txt.gz@phenoData@data
+
+remove(gdsGSE228421)
+
+```
+
+```{r set_colors}
+
+tissueColors <- c("Non Lesional" = "darkcyan",
+                   "Lesional" = "red")
+
+donorColors <- rcartocolor::carto_pal(5, "Vivid")
+names(donorColors) <- c("P1", "P2", "P3", "P4", "P5")
+
+visitColors <- rcartocolor::carto_pal(3, "Vivid")
+names(visitColors) <- c("V1", "V2", "V3")
+
+groupColors <- rcartocolor::carto_pal(4, "Vivid")
+names(groupColors) <- c("NL_V1", "L_V1", "L_V2", "L_V3")
+
+```
+
+```{r read_data}
+
+# List all .csv.gz files in the directory
+geoFiles <- list.files(dataDir, full.names = TRUE)
+
+#Convert Ensembl IDs to HGNC symbols using annotables
+
+v38 <- annotables::grch38
+v37 <- annotables::grch37
+
+convertEnsemblToHGNC <- function(dataIn){
+  
+  hgncGenes <- v38$symbol[match(rownames(dataIn), v38$ensgene)]
+  hgncGenes[hgncGenes == ""] <- NA
+  #Some of the missing (NA) hgnc symbols look like they have v37 ensembl IDs
+  hgncV37Genes <- v37$symbol[match(rownames(dataIn), v37$ensgene)]
+  hgncGenes <- coalesce(hgncGenes, hgncV37Genes)
+  
+  #Filter the few rows without hgnc symbols
+  noSymbolRows <- which(is.na(hgncGenes))
+  dataIn <- dataIn[-noSymbolRows,]
+  hgncGenes <- hgncGenes[-noSymbolRows]
+  
+  #Filter rows with duplicated hgnc symbols
+  duplicatedRows <- which(duplicated(hgncGenes))
+  dataIn <- dataIn[-duplicatedRows,]
+  hgncGenes <- hgncGenes[-duplicatedRows]
+  
+  rownames(dataIn) <- hgncGenes
+  
+  return(dataIn)
+}
+
+
+# Function to read data and create a Seurat object
+readSeurat <- function(file) {
+  
+  #Write a note reporting what file is being read
+  cat("Reading file: ", file, "\n")
+  
+  data <- Read10X(file)
+  seuratObj <- CreateSeuratObject(counts = data$`Gene Expression`,
+                                                        min.features = 100,
+                                                        min.cells = 3)
+  
+  abData <- data$`Antibody Capture`
+  
+  keepCells <- colnames(seuratObj)
+  abData <- abData[,keepCells]
+  
+  #Clean memory
+  remove(gexAb)
+  
+  seuratObj[["FB"]] <- CreateAssayObject(abData)
+  seuratObj[["fileName"]] <- file
+  seuratObj[["gsm"]] <- str_extract(file, "GSM[0-9]+")
+  seuratObj[["percentMT"]] <- PercentageFeatureSet(seuratObj, pattern = "^MT-")
+  
+  return(seuratObj)
+}
+
+# Loop over the files and create a list of Seurat objects
+seuratList <- lapply(geoFiles, readSeurat)
+
+#merge all Seurat objects into one
+combinedSeurat <- merge(seuratList[[1]], y = seuratList[2:length(seuratList)])
+
+```
+
+```{r add_annotation}
+
+gsmIndexMatch <- match(combinedSeurat$gsm, GSE228421Anno$geo_accession)
+
+combinedSeurat$title <- GSE228421Anno$title[gsmIndexMatch] 
+
+combinedSeurat$donor <- str_extract(combinedSeurat$title, "P[0-9]")
+combinedSeurat$visit <- str_extract(combinedSeurat$title, "V[0-9]")
+combinedSeurat$tissue <- str_extract(combinedSeurat$title, "Non Lesional|Lesional")
+
+combinedSeurat@meta.data <- combinedSeurat@meta.data %>%
+  dplyr::mutate(group = case_when(
+    tissue == "Non Lesional"& visit == "V1" ~ "NL_V1",
+    tissue == "Lesional" & visit == "V1" ~ "L_V1",
+    tissue == "Lesional"& visit == "V2" ~ "L_V2",
+    tissue == "Lesional" & visit == "V3" ~ "L_V3",
+    TRUE ~ "Unknown",
+  ),
+  group = factor(group, levels = c("NL_V1", "L_V1", "L_V2", "L_V3", "Unknown")))
+
+
+```
+
+```{r quality_control}
+
+nFeatureLow <-500 
+nFeatureHigh <- 5000
+pctMtCutoff <- 15
+
+nFeatureHistogram <- hist(combinedSeurat$nFeature_RNA, 100, xlab = "nFeature RNA")
+
+#Add a vertical line to the histogram at the 500 feature cutoff
+abline(v = nFeatureLow, col = "red")
+abline(v = nFeatureHigh, col = "red")
+
+pctMitoHistogram <- hist(combinedSeurat$percentMT, 100, xlab = "% mitochondrial RNA")
+abline(v = pctMtCutoff, col = "red")
+
+combinedSeurat$qcPass <- combinedSeurat$nFeature_RNA > nFeatureLow & combinedSeurat$nFeature_RNA < nFeatureHigh & combinedSeurat$percentMT < pctMtCutoff
+
+combinedSeurat <- subset(combinedSeurat, 
+                      subset = nFeature_RNA > nFeatureLow & nFeature_RNA < nFeatureHigh & percentMT < pctMtCutoff)
+
+```
+
+```{r process_data}
+
+combinedSeurat <- JoinLayers(combinedSeurat)
+
+combinedSeurat <- NormalizeData(combinedSeurat)
+combinedSeurat <- FindVariableFeatures(combinedSeurat)
+combinedSeurat <- ScaleData(combinedSeurat)
+combinedSeurat <- RunPCA(combinedSeurat)
+
+combinedSeurat <- FindNeighbors(combinedSeurat, dims = 1:30)
+combinedSeurat <- FindClusters(combinedSeurat)
+
+combinedSeurat <- RunUMAP(combinedSeurat, dims = 1:30)
+
+
+```
+
+```{r visualize_data}
+
+umapPlotOptions <- list(labs(x = "UMAP 1",
+       y = "UMAP 2"),
+  theme(aspect.ratio = 1))
+
+DimPlot(combinedSeurat, reduction = "umap", 
+        group.by = c("seurat_clusters"),
+        label = TRUE)  +
+  umapPlotOptions
+
+
+DimPlot(combinedSeurat, reduction = "umap", 
+        group.by = c("donor")) +
+  umapPlotOptions
+
+DimPlot(combinedSeurat, reduction = "umap", 
+        group.by = c("tissue")) +
+  umapPlotOptions
+  
+#Donor effects look smaller than clusters and lesional/non-lesional differences.
+```
+
+```{r assign_cell_types}
+
+#Run celltypist in python with human skin atlas
+#Save as an h5ad object for use in python
+
+#Convert to V3 object
+seuratV3 <- combinedSeurat
+seuratV3[["RNA"]] <- as(object = seuratV3[["RNA"]], Class = "Assay")
+
+
+library(SeuratDisk)
+SaveH5Seurat(
+  seuratV3, 
+  filename = 
+    file.path(processedDataDir,"GSE228421.h5Seurat"),
+  overwrite = TRUE)
+Convert(
+  source = file.path(processedDataDir,"GSE228421.h5Seurat"),
+  dest = "h5ad", 
+  assay = "RNA",
+  overwrite = TRUE)
+
+
+```
+
+```{r read_cell_type_labels}
+
+skinLabels <- read.csv(file.path(processedDataDir,
+                                 "GSE228421WithAdultHumanSkinPredictions.csv"))
+
+
+rownames(skinLabels) <- skinLabels$X
+
+skinLabels <- skinLabels[,c("predicted_labels",
+                            "majority_voting",
+                            "conf_score")]
+
+combinedSeurat <- AddMetaData(combinedSeurat, 
+                              metadata = skinLabels)
+
+```
+
+```{r visualize_cell_types}
+
+DimPlot(combinedSeurat, reduction = "umap", 
+        group.by = c("majority_voting"),
+        label = TRUE) +
+  umapPlotOptions
+
+#Check with a few genes
+
+FeaturePlot(combinedSeurat,
+            features = c("KRT14", "KRT5", "KRT1",
+                         "COL1A1", "COL1A2", "COL3A1"),
+            ncol = 3) +
+  umapPlotOptions
+
+#Things look okay
+```
+
+```{r save_data}
+
+#saveRDS(combinedSeurat, file = file.path(processedDataDir, "GSE228421Seurat.rds"))
+combinedSeurat <- readRDS(file.path(processedDataDir, "GSE228421Seurat.rds"))
+
+```
+
+```{r subset_to_fibs_kcs}
+#Clean up
+# remove(seuratV3)
+# remove(data)
+# remove(seuratList)
+
+seuratFB <- subset(combinedSeurat, 
+                    subset = majority_voting == "F2")
+
+seuratKC <- subset(combinedSeurat,
+                    subset = majority_voting %in% c("Differentiated_KC",
+                                                    "Undifferentiated_KC"))
+
+#Clean up
+remove(combinedSeurat)
+
+```
+
+```{r clean_up}
+
+umapPlotOptions <- list(labs(x = "UMAP 1",
+       y = "UMAP 2"),
+  theme(aspect.ratio = 1))
+
+seuratKC@meta.data <- seuratKC@meta.data %>%
+  dplyr::mutate(group = case_when(
+    tissue == "Non Lesional"& visit == "V1" ~ "NL_V1",
+    tissue == "Lesional" & visit == "V1" ~ "L_V1",
+    tissue == "Lesional"& visit == "V2" ~ "L_V2",
+    tissue == "Lesional" & visit == "V3" ~ "L_V3" ),
+  group = factor(group, levels = c("NL_V1", "L_V1", "L_V2", "L_V3")))
+
+
+seuratFB@meta.data <- seuratFB@meta.data %>%
+  dplyr::mutate(group = case_when(
+    tissue == "Non Lesional"& visit == "V1" ~ "NL_V1",
+    tissue == "Lesional" & visit == "V1" ~ "L_V1",
+    tissue == "Lesional"& visit == "V2" ~ "L_V2",
+    tissue == "Lesional" & visit == "V3" ~ "L_V3"  ),
+  group = factor(group, levels = c("NL_V1", "L_V1", "L_V2", "L_V3")))
+
+#Some FBs and KCs fall into peripheral clusters
+#Filter these cells
+
+DimPlot(seuratFB, 
+        reduction = "umap", 
+        group.by = c("donor")) +
+  umapPlotOptions
+
+DimPlot(seuratKC, 
+        reduction = "umap", 
+        group.by = c("donor")) +
+  umapPlotOptions
+
+
+seuratFB$UMAP1 <- seuratFB[["umap"]]@cell.embeddings[,1]
+seuratFB$UMAP2 <- seuratFB[["umap"]]@cell.embeddings[,2]
+
+seuratKC$UMAP1 <- seuratKC[["umap"]]@cell.embeddings[,1]
+seuratKC$UMAP2 <- seuratKC[["umap"]]@cell.embeddings[,2]
+
+seuratFB <- subset(seuratFB,
+                          subset = ((UMAP1 > -11) & (UMAP1 < 5)) & ((UMAP2 > 4)))
+
+seuratKC <- subset(seuratKC,
+                          subset = (UMAP1 > -2) & (UMAP2 < 10))
+
+gUMAPFB <- DimPlot(seuratFB, 
+        reduction = "umap", 
+        group.by = c("tissue"),
+        shuffle = TRUE) +
+  scale_color_manual(values = tissueColors) +
+  umapPlotOptions +
+  labs(title = NULL)
+
+gUMAPKC <- DimPlot(seuratKC, 
+        reduction = "umap", 
+        group.by = c("tissue"),
+        shuffle = TRUE) +
+  scale_color_manual(values = tissueColors) +
+  umapPlotOptions
+
+png(file.path(plotDir, "GSE228421PsSingleCell_FB_UMAP.png"), width = 400, height = 400)
+print(gUMAPFB)
+dev.off()
+
+png(file.path(plotDir, "GSE228421PsSingleCell_KC_UMAP.png"), width = 400, height = 400)
+print(gUMAPKC)
+dev.off()
+
+
+#Assess donor effects
+
+gUMAPFB <- DimPlot(seuratFB, 
+        reduction = "umap", 
+        group.by = c("donor"),
+        shuffle = TRUE) +
+  scale_color_manual(values = donorColors) +
+  umapPlotOptions 
+
+gUMAPKC <- DimPlot(seuratKC, 
+        reduction = "umap", 
+        group.by = c("donor"),
+        shuffle = TRUE) +
+  scale_color_manual(values = donorColors) +
+  umapPlotOptions 
+
+png(file.path(plotDir, "GSE228421PsSingleCell_FB_UMAP_DonorColors.png"), width = 400, height = 400)
+print(gUMAPFB)
+dev.off()
+
+png(file.path(plotDir, "GSE228421PsSingleCell_KC_UMAP_DonorColors.png"), width = 400, height = 400)
+print(gUMAPKC)
+dev.off()
+
+#Assess visit effects
+
+gUMAPFB <- DimPlot(seuratFB, 
+        reduction = "umap", 
+        group.by = c("group"),
+        shuffle = TRUE) +
+  scale_color_manual(values = groupColors,
+                     labels = c("Day 0 Non-Lesional",
+                                "Day 0 Lesional",
+                                "Day 3 Lesional",
+                                "Day 14 Lesional")) +
+  umapPlotOptions +
+  labs(title = NULL)
+
+gUMAPKC <- DimPlot(seuratKC, 
+        reduction = "umap", 
+        group.by = c("group"),
+        shuffle = TRUE) +
+  scale_color_manual(values = groupColors) +
+  umapPlotOptions 
+
+png(file.path(plotDir, "GSE228421PsSingleCell_FB_UMAP_VisitColors.png"), width = 400, height = 400)
+print(gUMAPFB)
+dev.off()
+
+png(file.path(plotDir, "GSE228421PsSingleCell_KC_UMAP_VisitColors.png"), width = 400, height = 400)
+print(gUMAPKC)
+dev.off()
+
+pdf(file.path(plotDir, "FrancisEtAl_UMAP_GroupColors.pdf"), width = 5, height = 4)
+print(gUMAPFB)
+dev.off()
+
+
+gUMAPKC <- DimPlot(seuratKC, 
+        reduction = "umap", 
+        group.by = c("majority_voting"),
+        shuffle = TRUE) +
+  umapPlotOptions 
+
+png(file.path(plotDir, "GSE228421PsSingleCell_KC_UMAP_CellTypeColors.png"), width = 400, height = 400)
+print(gUMAPKC)
+dev.off()
+
+```
+
+```{r compute_t_cell_sup_scores}
+
+read_all_sheets = function(xlsxFile, ...) {
+  sheet_names = openxlsx::getSheetNames(xlsxFile)
+  sheet_list = as.list(rep(NA, length(sheet_names)))
+  names(sheet_list) = sheet_names
+  for (sn in sheet_names) {
+    sheet_list[[sn]] = openxlsx::read.xlsx(xlsxFile, sheet=sn, colNames = FALSE,...)
+  }
+  return(sheet_list)
+}
+
+
+supFBGeneSets <- read_all_sheets(file.path(tableDir, "SupStimulatedFBGeneSets.xlsx"))
+cytokineFBGeneSets <- read_all_sheets(file.path(tableDir, "CytokineStimulatedFBGeneSets.xlsx"))
+
+supKCGeneSets <- read_all_sheets(file.path(tableDir, "SupStimulatedKCGeneSets.xlsx"))
+cytokineKCGeneSets <- read_all_sheets(file.path(tableDir, "CytokineStimulatedKCGeneSets.xlsx"))
+
+#Filter to cytokine gene sets of interest at 24 hours
+
+cleanCytokineGeneSets <- function(cytokineGeneSets){
+  
+  cytokineGeneSets <- cytokineGeneSets[c("IFNG_24hr",
+                                         "IL13_24hr",
+                                         "IL17A_24hr",
+                                         "IL22_24hr",
+                                         "IL26_24hr")]
+  
+  names(cytokineGeneSets) <- str_remove(names(cytokineGeneSets), "_24hr")
+  cytokineGeneSets <- lapply(cytokineGeneSets, function(df) df$X1)
+  
+  
+  return(cytokineGeneSets)
+}
+
+cleanSupGeneSets <- function(supGeneSets){
+  
+  supGeneSets <- lapply(supGeneSets, function(df) df$X1)
+  
+  return(supGeneSets)
+}
+
+cytokineFBGeneSets <- cleanCytokineGeneSets(cytokineFBGeneSets)
+cytokineKCGeneSets <- cleanCytokineGeneSets(cytokineKCGeneSets)
+supFBGeneSets <- cleanSupGeneSets(supFBGeneSets)
+supKCGeneSets <- cleanSupGeneSets(supKCGeneSets)
+
+```
+
+```{r compute_module_scores}
+
+
+computeSupModScores <- function(seuratObj,
+                                supGeneSets) {
+  
+  seuratObj <- AddModuleScore(seuratObj,
+                             features = supGeneSets,
+                             name="supGeneSet",
+                             seed = 42)
+  
+  seuratObj$Blood_CD4_Th1 <- seuratObj$supGeneSet1
+  seuratObj$Blood_CD4_Th2 <- seuratObj$supGeneSet2
+  seuratObj$Blood_CD4_Th17 <- seuratObj$supGeneSet3
+  seuratObj$Blood_CD4_Th22 <- seuratObj$supGeneSet4
+  seuratObj$Blood_CD4_CD103pos <- seuratObj$supGeneSet5
+  seuratObj$Skin_CD4_CD103neg <- seuratObj$supGeneSet6
+  seuratObj$Skin_CD4_CD103pos <- seuratObj$supGeneSet7
+  
+  return(seuratObj)
+
+}
+
+computeCytokineModScores <- function(seuratObj,
+                                cytokineGeneSets) {
+  
+  seuratObj <- AddModuleScore(seuratObj,
+                             features = cytokineGeneSets,
+                             name="cytokineGeneSet",
+                             seed = 42)
+  
+  seuratObj$Cytokine_IFNG <- seuratObj$cytokineGeneSet1
+  seuratObj$Cytokine_IL13 <- seuratObj$cytokineGeneSet2
+  seuratObj$Cytokine_IL17A <- seuratObj$cytokineGeneSet3
+  seuratObj$Cytokine_IL22 <- seuratObj$cytokineGeneSet4
+  seuratObj$Cytokine_IL26 <- seuratObj$cytokineGeneSet5
+  
+  return(seuratObj)
+
+}
+
+
+seuratFB <- computeSupModScores(seuratFB, supFBGeneSets)
+seuratFB <- computeCytokineModScores(seuratFB, cytokineFBGeneSets)
+
+seuratKC <- computeSupModScores(seuratKC, supKCGeneSets)
+seuratKC <- computeCytokineModScores(seuratKC, cytokineKCGeneSets)
+
+```
+
+```{r visualize_module_scores}
+
+supScoreNames <- c("Blood_CD4_Th1",
+                   "Blood_CD4_Th2",
+                   "Blood_CD4_Th17",
+                   "Blood_CD4_Th22",
+                   "Blood_CD4_CD103pos",
+                   "Skin_CD4_CD103neg",
+                   "Skin_CD4_CD103pos")
+
+cytokineScoreNames <- c("Cytokine_IFNG",
+                        "Cytokine_IL13",
+                        "Cytokine_IL17A",
+                        "Cytokine_IL22",
+                        "Cytokine_IL26")
+
+gUMAPFBSup <- FeaturePlot(object = seuratFB, 
+                          reduction = "umap", 
+                          features = supScoreNames,
+                          #order=TRUE,
+                     max.cutoff = 'q95',
+                     ncol = 3) &
+  labs(x = "UMAP 1", y ="UMAP 2") &
+  scale_color_viridis() &
+  umapPlotOptions 
+
+gUMAPFBCytokine <- FeaturePlot(object = seuratFB, 
+                          reduction = "umap", 
+                          features = cytokineScoreNames,
+                          #order=TRUE,
+                     max.cutoff = 'q95',
+                     ncol = 4) &
+  labs(x = "UMAP 1", y ="UMAP 2") &
+  scale_color_viridis() &
+  umapPlotOptions
+
+
+gUMAPKCSup <- FeaturePlot(object = seuratKC, 
+                          reduction = "umap", 
+                          features = supScoreNames,
+                         # order=TRUE,
+                    max.cutoff = 'q95',
+                     ncol = 4) &
+  labs(x = "UMAP 1", y ="UMAP 2") &
+  scale_color_viridis() &
+  umapPlotOptions
+
+gUMAPKCCytokine <- FeaturePlot(object = seuratKC, 
+                          reduction = "umap", 
+                          features = cytokineScoreNames,
+                          #order=TRUE,
+                     max.cutoff = 'q95',
+                     ncol = 4) &
+  labs(x = "UMAP 1", y ="UMAP 2") &
+  scale_color_viridis() &
+  umapPlotOptions
+
+
+png(file.path(plotDir, "GSE228421PsSingleCell_FB_SupScores_UMAP.png"), width = 1000, height = 600)
+print(gUMAPFBSup)
+dev.off()
+
+png(file.path(plotDir, "GSE228421PsSingleCell_FB_CytokineScores_UMAP.png"), width = 1000, height = 600)
+print(gUMAPFBCytokine)
+dev.off()
+
+png(file.path(plotDir, "GSE228421PsSingleCell_KC_SupScores_UMAP.png"), width = 1000, height = 600)
+print(gUMAPKCSup)
+dev.off()
+
+png(file.path(plotDir, "GSE228421PsSingleCell_KC_CytokineScores_UMAP.png"), width = 1000, height = 600)
+print(gUMAPKCCytokine)
+dev.off()
+
+pdf(file.path(plotDir, "FrancisEtAl_UMAP_SupernatantScores.pdf"), height = 8, width = 10)
+print(gUMAPFBSup)
+dev.off()
+
+#Plot Violins of FB sup scores
+
+# seuratFB@meta.data <- seuratFB@meta.data %>%
+#   dplyr::mutate(tissueType = factor(tissueType, 
+#                                     levels = c("HC", "PS_NL", "PS_L")))
+# 
+# gViolinFBSup <- VlnPlot(seuratFB, 
+#                         features = supScoreNames,
+#                         group.by = "tissueType",
+#                         pt.size = 0,
+#                         ncol = 4) &
+#   scale_fill_manual(values = tissueColors) &
+#   theme(aspect.ratio = 1)
+# 
+# pdf(file.path(plotDir, "GSE228421PsSingleCell_FB_CytokineScores_Violin.pdf"), width = 10, height = 8)
+# print(gViolinFBSup)
+# dev.off()
+
+```
+
+```{r pseudobulk}
+
+pseudoFBByDonor <- AggregateExpression(seuratFB, assays = "RNA", return.seurat = T, group.by = c("donor", "group"))
+pseudoFBByDonor@meta.data <- pseudoFBByDonor@meta.data %>%
+  dplyr::mutate(group = str_replace(group, "-", "_"),
+                group = factor(group, levels = c("NL_V1", "L_V1", "L_V2", "L_V3"))) 
+
+pseudoKCByDonor <- AggregateExpression(seuratKC, assays = "RNA", return.seurat = T, group.by = c("donor", "group"))
+
+pseudoCounts <- GetAssayData(pseudoFBByDonor, slot = "data")
+pseudoMetadata <- pseudoFBByDonor@meta.data 
+
+selGenes <- Reduce(union, supFBGeneSets)
+selGenes <- intersect(selGenes, rownames(pseudoCounts))
+
+hmapCounts <- pseudoCounts %>% as.matrix()
+
+designHmap <- pseudoMetadata %>%
+  dplyr::arrange(group,
+                 donor) 
+
+hmapCounts <- hmapCounts[selGenes, designHmap$orig.ident]
+hmapCounts <- hmapCounts[rowSums(hmapCounts)>0,]
+selGenes <- rownames(hmapCounts)
+#Make a heatmap
+
+columnAnno <- HeatmapAnnotation(Group = designHmap$group,
+                                col = list(Group = groupColors))
+
+tfColors <- c("TRUE" = "black",
+              "FALSE" = "white")
+
+rowAnno <- rowAnnotation("Th1" = selGenes %in% supFBGeneSets$`Blood CD4+ Th1`,
+                         "Th2" = selGenes %in% supFBGeneSets$`Blood CD4+ Th2`,
+                         "Th17" = selGenes %in% supFBGeneSets$`Blood CD4+ Th17`,
+                         "Th22" = selGenes %in% supFBGeneSets$`Blood CD4+ Th22`,
+                         "BloodCD103pos" = selGenes %in% supFBGeneSets$`Blood CD4+ CD103+`,
+                         "SkinCD103neg" = selGenes %in% supFBGeneSets$`Skin CD4+ CD103-`,
+                         "SkinCD103pos" = selGenes %in% supFBGeneSets$`Skin CD4+ CD103+`,
+                         col = list("Th1" = tfColors,
+                                    "Th2" = tfColors,
+                                    "Th17" = tfColors,
+                                    "Th22" = tfColors,
+                                    "BloodCD103pos" = tfColors,
+                                    "SkinCD103neg" = tfColors,
+                                    "SkinCD103pos" = tfColors))
+
+scaledCounts <- t(scale(t(hmapCounts))) 
+colFun = circlize::colorRamp2(c(-3, 0, 3), c("blue", "white", "red"))
+
+hmap <- Heatmap(scaledCounts,
+                name = "Row z-score",
+                col = colFun, 
+                top_annotation = columnAnno,
+                right_annotation = rowAnno,
+                column_split = designHmap$seurat_clusters,
+                cluster_columns = FALSE, 
+                row_names_gp = gpar(fontsize = 8),
+                show_column_names = FALSE,
+                show_row_names = FALSE)
+  
+  
+  pdf(file.path(plotDir,
+                paste0("GSE228421PsSingleCell_Heatmap_SupFBGenes", ".pdf")),
+      height = 9,
+      width = 9)
+  
+  draw(hmap)
+  
+  invisible(dev.off())
+```
+
+```{r calc_genesetscores}
+
+geneSetHeatmapScores <- function(geneSetObj,
+                           countsObj){
+  
+  selectedGeneSets <- names(geneSetObj)
+  selectedGenes <- geneSetObj[selectedGeneSets] 
+  
+  #countsObj <- log2(countsObj+1)
+  
+  #Get the mean gene set score for all libs 
+  
+  scoreMatrix <- matrix(data=NA, 
+                        nrow=length(selectedGeneSets), 
+                        ncol=ncol(countsObj))
+  
+  for(i in 1:length(selectedGeneSets)){
+    
+      setGenes <- geneSetObj[[selectedGeneSets[i]]]
+      setGenes <- setGenes[!is.na(setGenes)]
+      setGenes <- setGenes[setGenes != ""]
+      setGenes <- setGenes[setGenes %in% rownames(countsObj)]
+        
+      countsObjSubset <- countsObj[setGenes,]
+    
+      #setScores <- apply(countsObjSubset, 2, function(x) exp(mean(log(x))))
+      setScores <- apply(countsObjSubset, 2, function(x) mean(x))
+      
+      scoreMatrix[i,] <- t(setScores)
+    
+  }
+  
+  rownames(scoreMatrix) <- selectedGeneSets
+  colnames(scoreMatrix) <- colnames(countsObj)
+    
+  return(scoreMatrix)
+}
+
+```
+
+```{r gene_set_scores_in_pseudobulk}
+
+scoreMatrixSupFB <- geneSetHeatmapScores(supFBGeneSets,
+                    pseudoCounts)
+
+```
+
+
+```{r score_heatmap}
+
+designHmap <- pseudoMetadata %>%
+  dplyr::arrange(group,
+                 donor) 
+
+hmapData <- scoreMatrixSupFB[,designHmap$orig.ident]
+
+
+topAnno <- HeatmapAnnotation(Group = designHmap$group,
+                             col = list(Group = groupColors))
+
+
+hmapSupFB <- Heatmap(hmapData,
+                           col= rcartocolor::carto_pal(10, "ag_Sunset"),
+        name = "Gene set score",
+        cluster_columns = FALSE,
+        top_annotation = topAnno,
+        show_column_names = F) 
+
+pdf(file.path(plotDir, "GSE228421PsSingleCell_Heatmap_FBSupScores.pdf"), width = 10, height = 4)
+
+draw(hmapSupFB)
+
+invisible(dev.off())
+```
+
+```{r dot_plots}
+
+scoresSupFB <- scoreMatrixSupFB %>% t() %>% as.data.frame()
+
+scoresSupFB$orig.ident <- rownames(scoresSupFB)
+
+designHmap  <- left_join(designHmap,
+                           scoresSupFB)
+
+pd <- position_dodge(0.1)
+
+supFB <- designHmap  %>%
+  pivot_longer(cols =  c("Blood CD4+ Th1",
+                        "Blood CD4+ Th2",
+                        "Blood CD4+ Th17",
+                        "Blood CD4+ Th22",
+                        "Blood CD4+ CD103+",
+                        "Skin CD4+ CD103-",
+                        "Skin CD4+ CD103+"),
+               names_to = "sup",
+               values_to = "score")
+
+
+gDotPlots <- supFB %>%
+  ggplot(aes(x = group, 
+             y = score, 
+             group = donor)) +
+  geom_point(position = pd) +
+   geom_line(position = pd) +
+  labs(x = "",
+       y = "Gene set score") +
+   theme(axis.text.x=element_text(angle=60, hjust=1),
+         axis.text=element_text(size=10),
+            axis.title=element_text(size=10)) +
+  facet_wrap(~sup, scales = "free_y") 
+
+pdf(file.path(plotDir, 
+              "GSE228421PsSingleCell_DotPlots_FBSupScores.pdf"),
+    height = 8,
+    width = 10)
+
+print(gDotPlots)
+
+invisible(dev.off())
+
+scoreStats <- supFB %>%
+  dplyr::group_by(sup) %>%
+  rstatix::t_test(score ~ group, 
+                  p.adjust.method = "fdr") 
+
+write.csv(scoreStats,
+          file = file.path(tableDir, "FrancisEtAl_FBSupernatantScoreStatistics.csv"),
+          row.names = F)
+
+
+```
+
+```{r plot_averages}
+
+supColors <- c("#FF3333", "#993333", "#FFCC66", 
+                    "#66CCFF", "#009966", "#CC99CC", "#666666") 
+
+names(supColors) <- levels(as.factor(supFB$sup))
+
+pdf(file.path(plotDir, 
+              "FrancisEtAl_SmoothPlots_Th17_SkinCD103pos_FBSupScores.pdf"),
+    height = 4,
+    width = 8)
+
+supFB %>%
+  dplyr::filter(sup %in% c("Blood CD4+ Th17", "Skin CD4+ CD103+")) %>%
+  ggplot(aes(x = group, 
+             y = score, 
+             group = sup,
+             color = sup,
+             fill = sup)) +
+  geom_smooth() +
+  scale_color_manual(values = supColors) +
+  scale_fill_manual(values = supColors) +
+  labs(x = "",
+       y = "Gene set score",
+       color = "",
+       fill = "") +
+   theme(axis.text.x=element_text(angle=60, hjust=1)) 
+
+invisible(dev.off())
+
+pdf(file.path(plotDir, 
+              "FrancisEtAl_SmoothPlots_Others_FBSupScores.pdf"),
+    height = 4,
+    width = 8)
+
+supFB %>%
+  dplyr::filter(!(sup %in% c("Blood CD4+ Th17", "Skin CD4+ CD103+"))) %>%
+  ggplot(aes(x = group, 
+             y = score, 
+             group = sup,
+             color = sup,
+             fill = sup)) +
+  geom_smooth() +
+  scale_color_manual(values = supColors) +
+  scale_fill_manual(values = supColors) +
+  labs(x = "",
+       y = "Gene set score",
+       color = "",
+       fill = "") +
+   theme(axis.text.x=element_text(angle=60, hjust=1)) 
+
+invisible(dev.off())
+
+```
+
+```{r manuscript_data_tables}
+
+fig6JTable <- supFB %>%
+  dplyr::filter(sup %in% c("Blood CD4+ Th17",
+                           "Skin CD4+ CD103+")) %>%
+  dplyr::select(donor, group, sup, score) %>%
+  dplyr::rename(`Gene set score` = score,
+                `T cell signature` = sup)
+
+write.csv(fig6JTable, file.path(manuscriptTableDir, "Fig6JRevised_SingleCellPsScores.csv"), row.names = FALSE)
+
+figS8ETable <- supFB %>%
+  dplyr::filter(sup %in% c("Blood CD4+ CD103+",
+                           "Blood CD4+ Th1",
+                           "Blood CD4+ Th2",
+                           "Blood CD4+ Th22",
+                           "Skin CD4+ CD103-")) %>%
+  dplyr::select(donor, group, sup, score) %>%
+  dplyr::rename(`Gene set score` = score,
+                `T cell signature` = sup)
+
+write.csv(figS8ETable, file.path(manuscriptTableDir, "FigS8ERevised_SingleCellPsScores.csv"), row.names = FALSE)
+
+```
+
